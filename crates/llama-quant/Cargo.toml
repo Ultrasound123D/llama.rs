@@ -1,0 +1,9 @@
+[package]
+name = "llama-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGML quant block formats + dequantization + quantized matvec kernels — Rust port of ggml-quants.c (b12502)"
+
+[dependencies]
+llama-gguf = { path = "../llama-gguf" }

@@ -1,0 +1,11 @@
+[package]
+name = "llama-rs-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "llama.rs CLI: generate / chat / tokenize / bench"
+
+[dependencies]
+llama-core = { path = "../../crates/llama-core" }
+llama-gguf = { path = "../../crates/llama-gguf" }
+llama-quant = { path = "../../crates/llama-quant" }

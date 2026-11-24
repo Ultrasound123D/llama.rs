@@ -1,0 +1,4 @@
+/target
+*.gguf
+*.tmp
+.DS_Store

@@ -1,0 +1,11 @@
+[package]
+name = "llama-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core inference engine: model architectures (LFM3 hybrid, llama/qwen family), BPE tokenizer, sampler, chat — Rust port of llama.cpp engine (b12502)"
+
+[dependencies]
+llama-gguf = { path = "../llama-gguf" }
+llama-quant = { path = "../llama-quant" }
+unicode-general-category = "0.6"

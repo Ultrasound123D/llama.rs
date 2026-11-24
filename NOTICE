@@ -1,0 +1,18 @@
+llama.rs — Native Rust reimplementation of the llama.cpp inference engine.
+
+This project is a from-scratch reimplementation, in pure Rust with no C/C++
+code linked at runtime, of algorithms and behaviors of:
+
+  llama.cpp — Copyright (c) 2026 ggml-org / Georgi Gerganov and contributors
+  https://github.com/ggml-org/llama.cpp — MIT License
+
+Algorithm-level attribution to exact upstream source locations
+(file:line of tag b12502, commit 398f00d65) is documented in
+LLAMA_RS_ARCHITECTURE.md, section 2.
+
+The files tests/parity/ref_q5.c and tests/parity/ref_q6.c are small
+ground-truth harnesses transcribed from ggml/src/ggml-quants.c (MIT,
+llama.cpp) and are used only as golden references in parity tests.
+
+The parity test harness (tests/parity/run_parity.sh) compares llama.rs
+outputs against upstream llama.cpp binaries as the golden reference.
