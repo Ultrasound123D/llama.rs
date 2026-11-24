@@ -1,4 +1,4 @@
-// تشخيص عميق: طباعة قيم وسيطة بعد أول طبقة
+// Deep diagnostics: print intermediate values after the first layer
 use llama_core::model::LlamaFamily;
 use llama_core::{rmsnorm, W, weights1d, silu};
 
@@ -29,7 +29,7 @@ fn main() {
     }
     println!("v[0..6]: {:?}", &v[..6]);
 
-    // GQA: 14 رأس q × 2 رأس kv → تكرار v (توكن واحد: attention = v المكرر)
+    // GQA: 14 q heads × 2 kv heads → repeat v (single token: attention = repeated v)
     let rep = m.n_head / m.n_head_kv;
     let mut v_rep = vec![0f32; m.n_head * m.head_dim];
     for hq in 0..m.n_head {

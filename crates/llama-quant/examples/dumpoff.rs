@@ -1,4 +1,4 @@
-// تشخيص إزاحات الموترات: اطبع أول 5 موترات مع الإزاحات والأحجام
+// Tensor offset diagnostics: print the first tensors with offsets and sizes
 use llama_gguf::GgufFile;
 
 fn main() {

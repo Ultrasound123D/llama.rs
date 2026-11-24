@@ -1,15 +1,15 @@
-//! llama-gguf — قارئ GGUF v3
-//! نقل Rust لسلوك ggml/src/gguf.cpp + llama-model-loader.cpp (b12502):
-//! header {GGUF, version, n_tensors, n_kv}، ثم KV metadata ثم جدول التوترات
-//! ثم بيانات التوترات بمحاذاة GGUF_GENERAL_ALIGNMENT = 32.
-// أسماء أنواع التكميم تطابق ggml.h حرفياً (Q4_K، Q5_K، ...) للحفاظ على
-// التطابق المرجعي مع أسماء llama.cpp — لذا نسمح بهذه التسمية عمداً.
+//! llama-gguf — GGUF v3 reader
+//! Rust port of the behavior of ggml/src/gguf.cpp + llama-model-loader.cpp (b12502):
+//! header {GGUF, version, n_tensors, n_kv}, then KV metadata, then the tensor table,
+//! then tensor data aligned to GGUF_GENERAL_ALIGNMENT = 32.
+// Quantization type names match ggml.h verbatim (Q4_K, Q5_K, ...) to keep
+// reference parity with llama.cpp naming — so this naming is allowed deliberately.
 #![allow(non_camel_case_types)]
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read};
 
-/// قيم type الـ metadata كما في gguf.h
+/// Metadata "type" values as in gguf.h
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     U8(u8), I8(i8), U16(u16), I16(i16), U32(u32), I32(i32),
@@ -76,7 +76,7 @@ pub enum GgmlType {
 
 impl GgmlType {
     pub fn from_u32(v: u32) -> Option<GgmlType> {
-        // التعداد الرسمي ggml.h: F32=0 F16=1 Q4_0=2 Q4_1=3 Q5_0=6 Q5_1=7 Q8_0=8 Q8_1=9
+        // official ggml.h enum: F32=0 F16=1 Q4_0=2 Q4_1=3 Q5_0=6 Q5_1=7 Q8_0=8 Q8_1=9
         // Q2_K=10 Q3_K=11 Q4_K=12 Q5_K=13 Q6_K=14 Q8_K=15 I8=24 BF16=30
         use GgmlType::*;
         Some(match v {
@@ -95,7 +95,7 @@ impl GgmlType {
             AUTO | BITS | Q4_1_3BIT => 0,
         }
     }
-    /// حجم كتلة واحدة بالبايت
+    /// Size of one block in bytes
     pub fn block_size(&self) -> u64 {
         use GgmlType::*;
         match self {
@@ -115,7 +115,7 @@ impl GgmlType {
             AUTO | BITS | Q4_1_3BIT => 0,
         }
     }
-    /// عدد القيم في الكتلة
+    /// Number of values in the block
     pub fn block_vals(&self) -> u64 {
         use GgmlType::*;
         match self {
@@ -137,14 +137,14 @@ impl GgmlType {
     }
 }
 
-/// عدد الأنصاب لكل بعد (ggml يخزن بالمقلوب: ne[0] أسرع الأبعاد)
+/// Number of elements per dimension (ggml stores reversed: ne[0] is the fastest dimension)
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,
-    /// dims[0..n] بترتيب gguf (ne[0] أولاً)
+    /// dims[0..n] in gguf order (ne[0] first)
     pub dims: Vec<u64>,
     pub ty: GgmlType,
-    /// إزاحة البداية ضمن الملف (بعد جدول التوترات) — نسبية لنهاية الجدول
+    /// Offset of the tensor within the file (after the tensor table) — relative to the end of the table
     pub offset: u64,
 }
 
@@ -153,9 +153,9 @@ pub struct GgufFile {
     pub metadata: HashMap<String, Value>,
     pub tensors: Vec<TensorInfo>,
     tensor_index: HashMap<String, usize>,
-    /// إزاحة أول بايت بعد جدول التوترات (بدء منطقة البيانات)
+    /// Offset of the first byte after the tensor table (start of the data region)
     pub data_start: u64,
-    /// الملف كامل في الذاكرة (نموذج 1GB مقبول؛ يُقصد البقاء مكمّماً)
+    /// The whole file in memory (a 1GB model is acceptable; the intent is to stay quantized)
     pub data: Vec<u8>,
 }
 
@@ -195,11 +195,11 @@ impl GgufFile {
             }
             let ty = GgmlType::from_u32(r.read_u32()?)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad tensor type"))?;
-            r.read_u64()?; // offset داخل منطقة البيانات (نُعيد حسابه لأننا نقرأ تتابعياً)
+            r.read_u64()?; // offset within the data region (recomputed, since we read sequentially)
             tensors.push(TensorInfo { name, dims, ty, offset: 0 });
         }
         let table_end = r.pos as u64;
-        // محاذاة 32 لمنطقة البيانات (نفس gguf.cpp: GGUF_ALIGNMENT)
+        // 32-byte alignment for the data region (same as gguf.cpp: GGUF_ALIGNMENT)
         let data_start = (table_end + GGUF_ALIGNMENT - 1) & !(GGUF_ALIGNMENT - 1);
         let mut offset = 0u64;
         for t in tensors.iter_mut() {
@@ -216,7 +216,7 @@ impl GgufFile {
     }
 
     pub fn get_meta(&self, key: &str) -> Option<&Value> {
-        // نبحث بالمعمارية أولاً (lfm3.*) ثم العام (ggml.)
+        // look up by architecture first (lfm3.*), then general (ggml.)
         let arch = self.arch().unwrap_or("");
         if !arch.is_empty() {
             if let Some(v) = self.metadata.get(&format!("{arch}.{key}")) {
@@ -231,7 +231,7 @@ impl GgufFile {
         self.tensor_index.get(name).map(|&i| &self.tensors[i])
     }
 
-    /// شريحة بايتات موتر كامل (dims قد تحدد مجموعات فرعية لاحقاً)
+    /// Byte slice of a whole tensor (dims may later specify sub-groups)
     pub fn tensor_bytes(&self, t: &TensorInfo) -> &[u8] {
         let start = self.data_start as usize + t.offset as usize;
         let len = tensor_bytes(t) as usize;
@@ -246,7 +246,7 @@ impl GgufFile {
 fn tensor_bytes(t: &TensorInfo) -> u64 {
     let n_vals: u64 = t.dims.iter().product::<u64>().max(1);
     if t.ty == GgmlType::I8 {
-        return n_vals; // خاص
+        return n_vals; // special case
     }
     let per = t.ty.block_vals();
     let blocks = n_vals.div_ceil(per);
@@ -298,7 +298,7 @@ impl<'a> Cursor<'a> {
                 if n > 5_000_000 { return Err(io::Error::new(io::ErrorKind::InvalidData, "array too large")); }
                 let mut vals = Vec::with_capacity(n.min(1 << 16));
                 for _ in 0..n {
-                    // قراءة كل عنصر بنفس نوع العنصر — نستهلك كاملاً للحفاظ على التزامن
+                    // read every element with the same element type — consume it fully to stay in sync
                     let saved = Cursor { data: self.data, pos: self.pos };
                     let mut sub = saved;
                     let v = sub.read_typed(et)?;

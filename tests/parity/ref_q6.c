@@ -1,5 +1,5 @@
-// مرجع Q6_K من ggml-quants.c:1949 حرفياً (llama.cpp, MIT) — ground truth للاختبار
-// ملاحظة: تقدّم المؤشرات ql/qh/sc بين نصفي الكتلة مطابق للمصدر (ql += 64; qh += 32; sc += 8)
+// Q6_K reference transcribed verbatim from ggml-quants.c:1949 (llama.cpp, MIT) — test ground truth
+// Note: the ql/qh/sc pointer advancement between the two halves of the block matches the source (ql += 64; qh += 32; sc += 8)
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

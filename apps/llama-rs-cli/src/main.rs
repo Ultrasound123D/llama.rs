@@ -1,4 +1,4 @@
-//! llama-rs-cli — واجهة سطر أوامر المحرك
+//! llama-rs-cli — command-line interface for the engine
 //! modes: generate | chat | tokenize | bench
 use llama_core::model::{Lfm3, LlamaFamily};
 use llama_core::tokenizer::BpeTokenizer;
@@ -65,7 +65,7 @@ fn main() {
             println!("tokens({}): {:?}", ids.len(), ids);
         }
         "generate" => {
-            // بلا قالب محادثة — تطابق llama-completion الخام
+            // no chat template — matches raw llama-completion
             let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
             let (tok_out, text) = generate(&mut model, &tokenizer, &ids, n_gen, temp);
             let _ = tok_out;
@@ -77,11 +77,11 @@ fn main() {
                 Model::Lfm3(_) => format_lfm3(&msgs, thinking, true),
                 Model::Llama(_) => format_chatml(&msgs, true),
             };
-            // استبدال علامة bos بنصها الخاص يتم عبر fragmentation
+            // replacing the bos marker with its special token happens via fragmentation
             let ids = tokenizer.tokenize(&formatted, None, false);
             let (out_ids, text) = generate_stop(&mut model, &tokenizer, &ids, n_gen, temp);
             let _ = out_ids;
-            // طباعة تجاهل وسم التفكير
+            // print without the thinking tags
             let shown = text
                 .replace(THINK_OPEN, "")
                 .replace(THINK_CLOSE, "");
@@ -89,7 +89,7 @@ fn main() {
         }
         "debug" => {
             let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
-            // prefill ثم طباعة أعلى 5
+            // prefill, then print the top-5
             let mut logits: Vec<f32>;
             {
                 let l = forward_token(&mut model, ids[0]);
@@ -151,7 +151,7 @@ fn generate_stop(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize, t
 }
 
 fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize, f32) {
-    // prefill ثم قياس توليد n توكن greedy
+    // prefill, then time the greedy generation of n tokens
     let mut logits: Vec<f32>;
     {
         let l = forward_token(model, ids[0]);

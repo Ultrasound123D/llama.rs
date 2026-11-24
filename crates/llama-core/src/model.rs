@@ -1,5 +1,5 @@
-//! نماذج: LFM3 (هجين shortconv+attention مع بوابة رأس وRoPE مكتسبة)
-//! + عائلة llama (llama1/2/3, qwen2/qwen2.5) — نقل src/models/lfm3.cpp وmodels/llama.cpp
+//! Models: LFM3 (hybrid shortconv+attention with a per-head gate and learned RoPE)
+//! + the llama family (llama1/2/3, qwen2/qwen2.5) — port of src/models/lfm3.cpp and models/llama.cpp
 use llama_gguf::{GgufFile, Value};
 
 // ============ LFM3 ============
@@ -18,15 +18,15 @@ pub struct Lfm3 {
     pub swa_window: usize, // 256
     pub rope_base_full: f64, // 1e6
     pub rope_base_swa: f64, // 1e4
-    pub rope_freqs: Option<Vec<f32>>, // 64 learned (للطبقات الكاملة فقط)
+    pub rope_freqs: Option<Vec<f32>>, // 64 learned (full-attention layers only)
     pub is_recr: Vec<bool>,    // 16 conv
     pub is_swa: Vec<bool>,     // 4 SWA
     pub has_post_norms: bool,
-    // KV cache لكل طبقة attention: [max_ctx][n_head_kv*head_dim]
+    // KV cache per attention layer: [max_ctx][n_head_kv*head_dim]
     kv_k: Vec<Vec<f32>>,
     kv_v: Vec<Vec<f32>>,
     kv_len: Vec<usize>,
-    // conv state لكل طبقة recurrent: [d_conv][n_embd] (channel-major: [ch][d_conv])
+    // conv state per recurrent layer: [d_conv][n_embd] (channel-major: [ch][d_conv])
     conv_state: Vec<Vec<f32>>,
     // conv kernel F32 [n_embd][l_cache] (channel-major taps)
     conv_kernels: Vec<Vec<f32>>,
@@ -39,7 +39,7 @@ pub struct Lfm3 {
     s_q: Vec<f32>, s_k: Vec<f32>, s_v: Vec<f32>, s_gate_h: Vec<f32>,
     s_scores: Vec<f32>, s_attn: Vec<f32>,
     logits: Vec<f32>,
-    // preloaded f32 weights صغيرة
+    // small preloaded f32 weights
     w_attn_norm: Vec<Vec<f32>>,
     w_ffn_norm: Vec<Vec<f32>>,
     w_post_anorm: Vec<Option<Vec<f32>>>,
@@ -67,7 +67,7 @@ impl Lfm3 {
         let rope_base_full = g("rope.freq_base");
         let rope_base_swa = g("rope.freq_base_swa");
 
-        // head_count_kv: مصفوفة بطول 24 — طبقات معينة فقط
+        // head_count_kv: array of length 24 — only specific layers
         let kv_arr: Vec<u64> = gguf.get_meta("attention.head_count_kv").unwrap()
             .as_arr().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
         let swa_arr: Vec<bool> = gguf.get_meta("attention.sliding_window_pattern").unwrap()
@@ -80,14 +80,14 @@ impl Lfm3 {
             Some(weights1d(&gguf, "rope_freqs.weight"))
         } else { None };
 
-        // الحالة
+        // state
         let n_attn = is_recr.iter().filter(|&&r| !r).count();
         let kv_k = vec![vec![0f32; n_ctx * n_head_kv * head_dim]; n_attn];
         let kv_v = vec![vec![0f32; n_ctx * n_head_kv * head_dim]; n_attn];
         let kv_len = vec![0usize; n_attn];
         let conv_state = vec![vec![0f32; n_embd * (l_cache - 1)]; is_recr.iter().filter(|&&r| r).count()];
         let conv_kernels: Vec<Vec<f32>> = (0..n_layer).filter(|&il| is_recr[il]).map(|il| {
-            // conv kernel [l_cache, n_embd] F32 — ne[0]=l_cache أسرع → قناة ch: taps عند ch*l_cache+k
+            // conv kernel [l_cache, n_embd] F32 — ne[0]=l_cache fastest → channel ch: taps at ch*l_cache+k
             let t = gguf.tensor(&format!("blk.{il}.shortconv.conv.weight")).unwrap();
             let data = gguf.tensor_bytes(t);
             let mut v = vec![0f32; n_embd * l_cache];
@@ -100,7 +100,7 @@ impl Lfm3 {
             v
         }).collect();
 
-        // أوزان norms محمّلة f32
+        // norm weights loaded as f32
         let w_attn_norm = (0..n_layer).map(|il| weights1d(&gguf, &format!("blk.{il}.attn_norm.weight"))).collect();
         let w_ffn_norm = (0..n_layer).map(|il| weights1d(&gguf, &format!("blk.{il}.ffn_norm.weight"))).collect();
         let has_post = gguf.tensor("blk.0.post_attention_norm.weight").is_some();
@@ -140,7 +140,7 @@ impl Lfm3 {
         self.gguf.tensor("token_embd.weight").unwrap().dims[1] as usize
     }
 
-    /// تمرير توكن واحد → logits (طول vocab)
+    /// Forward one token → logits (length = vocab)
     pub fn forward(&mut self, token: u32) -> &[f32] {
         let tok_emb = W::get(&self.gguf, "token_embd.weight");
         let x0 = tok_emb.column(token as usize, self.n_embd);
@@ -152,7 +152,7 @@ impl Lfm3 {
         let pos = self.pos;
 
         for il in 0..self.n_layer {
-            // ----- norm + فرع attention/conv -----
+            // ----- norm + attention/conv branch -----
             let h = rmsnorm(&x, &self.w_attn_norm[il], self.eps);
             let branch: Vec<f32> = if self.is_recr[il] {
                 self.shortconv_block(il, recr_idx, &h);
@@ -167,7 +167,7 @@ impl Lfm3 {
             if let Some(w) = &self.w_post_anorm[il] {
                 branch = rmsnorm(&branch, w, self.eps);
             }
-            // residual: x = branch + x (prev غير المُعمّى)
+            // residual: x = branch + x (un-normalized prev)
             for i in 0..n_e { x[i] = branch[i] + x[i]; }
 
             // ----- FFN (swiglu) -----
@@ -184,7 +184,7 @@ impl Lfm3 {
             for i in 0..n_e { x[i] = ffn_out[i] + x[i]; }
         }
 
-        // ----- رأس الخروج -----
+        // ----- output head -----
         let xn = rmsnorm(&x, &self.w_output_norm, self.eps);
         let out_w_name = if self.gguf.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
         let out_w = W::get(&self.gguf, out_w_name);
@@ -196,7 +196,7 @@ impl Lfm3 {
         &self.logits
     }
 
-    /// طبقة attention واحدة (بوابة رأس + q/k norm + rope + SWA/full)
+    /// One attention layer (head gate + q/k norm + rope + SWA/full)
     fn attn_block(&mut self, il: usize, attn_idx: usize, pos: usize, h: &[f32]) {
         let hd = self.head_dim;
         let nh = self.n_head;
@@ -211,12 +211,12 @@ impl Lfm3 {
         k_w.matvec(h, &mut self.s_k, self.n_threads);
         v_w.matvec(h, &mut self.s_v, self.n_threads);
 
-        // q/k norm لكل رأس (رؤوس q: 16 × 128؛ رؤوس k: 4 × 128)
+        // q/k norm per head (q heads: 16 × 128; k heads: 4 × 128)
         for hq in 0..nh {
             let s = hq * hd;
             let mut head: Vec<f32> = self.s_q[s..s + hd].to_vec();
             let mut normed = rmsnorm(&head, &self.w_q_norm[il], self.eps);
-            // rope: كاملة → base 1e6 + freqs؛ swa → base 1e4 بلا freqs
+            // rope: full → base 1e6 + freqs; swa → base 1e4 without freqs
             if !self.is_swa[il] {
                 rope_neox_inplace(normed.as_mut_slice(), pos, self.rope_base_full, self.rope_freqs.as_deref());
             } else {
@@ -245,12 +245,12 @@ impl Lfm3 {
         self.kv_len[attn_idx] = len + 1;
         let n_kv = len + 1;
 
-        // بوابة الرأس: sigmoid(attn_gate(h)) لكل رأس
+        // head gate: sigmoid(attn_gate(h)) per head
         let gate_w = W::get(&self.gguf, &format!("blk.{il}.attn_gate.weight"));
         gate_w.matvec(h, &mut self.s_gate_h, self.n_threads);
         for g in self.s_gate_h.iter_mut() { *g = sigmoid(*g); }
 
-        // انتباه لكل رأس q
+        // attention per q head
         let kcache = &self.kv_k[attn_idx];
         let vcache = &self.kv_v[attn_idx];
         let swa = if self.is_swa[il] { Some(self.swa_window) } else { None };
@@ -258,7 +258,7 @@ impl Lfm3 {
         for hq in 0..nh {
             let kvh = hq / rep;
             let qs = &self.s_q[hq * hd..(hq + 1) * hd];
-            // نمرر صفوف رأس kv واحد
+            // we pass the rows of one kv head
             let (s, v) = (&kcache[..], &vcache[..]);
             attention_one_head_sliced(qs, s, v, n_kv, nkv, kvh, hd, swa, &mut out_scratch, &mut self.s_scores);
             let g = self.s_gate_h[hq];
@@ -267,14 +267,14 @@ impl Lfm3 {
             }
         }
 
-        // إسقاط الخروج
+        // output projection
         let o_w = W::get(&self.gguf, &format!("blk.{il}.attn_output.weight"));
         o_w.matvec(&self.s_attn, &mut self.s_out[..n_e], self.n_threads);
-        // (self.s_attn هو الناتج الفعلي للطبقة)
+        // (self.s_attn is the actual output of the layer)
         self.s_attn.copy_from_slice(&self.s_out[..n_e]);
     }
 
-    /// طبقة shortconv واحدة: b,c,x = in_proj(h)؛ bx=b⊙x؛ نافذة [state, bx]؛ y=c⊙conv(bx)؛ out_proj
+    /// One shortconv layer: b,c,x = in_proj(h); bx=b⊙x; window [state, bx]; y=c⊙conv(bx); out_proj
     fn shortconv_block(&mut self, il: usize, recr_idx: usize, h: &[f32]) {
         let n_e = self.n_embd;
         let taps = self.l_cache;         // 7
@@ -292,16 +292,16 @@ impl Lfm3 {
         let mut y = vec![0f32; n_e];
         for ch in 0..n_e {
             let bx = b[ch] * xx[ch];
-            // نافذة: state(6) + bx → مجموع النقاط مع النواة
+            // window: state(6) + bx → sum of taps against the kernel
             let s_base = ch * d_conv;
             let k_base = ch * taps;
             let mut acc = 0f32;
             for k in 0..d_conv {
                 acc += kernel[k_base + k] * state[s_base + k];
             }
-            acc += kernel[k_base + d_conv] * bx; // النق الأخيرة = bx الحالي
+            acc += kernel[k_base + d_conv] * bx; // last tap = current bx
             y[ch] = c[ch] * acc;
-            // تحديث الحالة: إزاحة ثم bx آخر عنصر
+            // state update: shift, then bx as the last element
             for k in 0..d_conv - 1 {
                 state[s_base + k] = state[s_base + k + 1];
             }
@@ -321,7 +321,7 @@ impl Lfm3 {
     }
 }
 
-/// انتباه رأس واحد مع قراءة صفوف رأس kv محدد من مخازن [n_kv][nkv*hd]
+/// One attention head reading the rows of a given kv head from [n_kv][nkv*hd] buffers
 pub fn attention_one_head_sliced(
     q: &[f32],
     k_all: &[f32], v_all: &[f32],
@@ -360,7 +360,7 @@ pub fn attention_one_head_sliced(
     }
 }
 
-// ============ عائلة llama (llama1/2/3, qwen2, qwen2.5) ============
+// ============ llama family (llama1/2/3, qwen2, qwen2.5) ============
 
 pub struct LlamaFamily {
     pub gguf: GgufFile,
@@ -384,7 +384,7 @@ pub struct LlamaFamily {
     w_attn_norm: Vec<Vec<f32>>,
     w_ffn_norm: Vec<Vec<f32>>,
     w_output_norm: Vec<f32>,
-    // انحيازات Q/K/V (qwen2)
+    // Q/K/V biases (qwen2)
     b_q: Vec<Option<Vec<f32>>>,
     b_k: Vec<Option<Vec<f32>>>,
     b_v: Vec<Option<Vec<f32>>>,
@@ -459,7 +459,7 @@ impl LlamaFamily {
             if let Some(b) = &self.b_k[il] { for i in 0..self.s_k.len() { self.s_k[i] += b[i]; } }
             if let Some(b) = &self.b_v[il] { for i in 0..self.s_v.len() { self.s_v[i] += b[i]; } }
 
-            // rope neox على q/k
+            // neox rope on q/k
             for hq in 0..self.n_head {
                 let s = hq * self.head_dim;
                 let mut head: Vec<f32> = self.s_q[s..s + self.head_dim].to_vec();
@@ -481,7 +481,7 @@ impl LlamaFamily {
             self.kv_len[il] = len + 1;
             let n_kv = len + 1;
 
-            // انتباه GQA causal
+            // causal GQA attention
             let rep = self.n_head / self.n_head_kv;
             let (kcache, vcache) = (&self.kv_k[il], &self.kv_v[il]);
             let mut out_scratch = vec![0f32; self.head_dim];
@@ -527,7 +527,7 @@ impl LlamaFamily {
     }
 }
 
-// استيرادات (تجميع)
+// imports (aggregated)
 use crate::{W, weights1d, rmsnorm, rope_neox_inplace, softmax_inplace, swiglu_ffn, sigmoid};
 #[allow(unused_imports)]
 use Value as _;

@@ -1,5 +1,5 @@
-// مرجع فك تكميم Q5_0 — كود ggml الأصلي + تحويل f16 من المترجم نفسه (ground truth)
-// منقول من ggml/src/ggml-quants.c (llama.cpp, MIT) — للاستخدام في اختبارات التطابق فقط
+// Q5_0 dequantization reference — original ggml code + f16 conversion by the compiler itself (ground truth)
+// Transcribed from ggml/src/ggml-quants.c (llama.cpp, MIT) — for use in parity tests only
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

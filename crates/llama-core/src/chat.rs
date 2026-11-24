@@ -1,7 +1,7 @@
-//! قوالب محادثة subset — نقل القالب المضمّن في GGUF:
-//! LFM3: <|im_start|>assistant\n +  (تفكير مفعّل) /   (معطّل)
-//! التاريخ:  + thinking +  ثم المحتوى مباشرة
-//! ChatML القياسي لعائلة qwen/llama.
+//! Chat template subset — port of the template embedded in the GGUF:
+//! LFM3: <|im_start|>assistant\n + THINK_OPEN (thinking enabled) / THINK_CLOSE (disabled)
+//! history: THINK_OPEN + thinking + THINK_CLOSE, then the content directly
+//! Standard ChatML for the qwen/llama family.
 
 pub struct ChatMsg {
     pub role: String,       // "system" | "user" | "assistant"
@@ -11,10 +11,10 @@ pub struct ChatMsg {
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
 
-/// تنسيق LFM3 (مطابق حرفياً للقالب المضمّن — مستخرج بالبايتات)
+/// LFM3 formatting (byte-exact match of the embedded template — extracted by bytes)
 pub fn format_lfm3(msgs: &[ChatMsg], enable_thinking: bool, add_bos: bool) -> String {
     let mut s = String::new();
-    if add_bos { s.push('\u{1}'); } // يُستبدل بـ bos_token_id عند التوكِنة
+    if add_bos { s.push('\u{1}'); } // replaced by bos_token_id at tokenization time
     for m in msgs {
         s.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content));
     }
@@ -23,7 +23,7 @@ pub fn format_lfm3(msgs: &[ChatMsg], enable_thinking: bool, add_bos: bool) -> St
     s
 }
 
-/// ChatML القياسي (qwen2)
+/// Standard ChatML (qwen2)
 pub fn format_chatml(msgs: &[ChatMsg], add_gen: bool) -> String {
     let mut s = String::new();
     for m in msgs {

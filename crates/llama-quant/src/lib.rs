@@ -1,12 +1,12 @@
-//! llama-quant — بنى كتل ggml + فك التكميم + نواة matvec
-//! نقل حرفي لخوارزميات ggml/src/ggml-quants.c (b12502):
+//! llama-quant — ggml block structures + dequantization + matvec kernel
+//! Verbatim port of the ggml/src/ggml-quants.c algorithms (b12502):
 //! get_scale_min_k4:889, de q4_0:462, de q4_1:482, de q8_0:556,
 //! de q4_K:1539, de q5_K:1741, de q6_K:1949.
 use llama_gguf::GgmlType;
 
 // ---------- f16 / bf16 ----------
 
-/// IEEE 754 half → f32 (نفس سلوك GGML_FP16_TO_FP32)
+/// IEEE 754 half → f32 (same behavior as GGML_FP16_TO_FP32)
 #[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
@@ -16,14 +16,14 @@ pub fn f16_to_f32(bits: u16) -> f32 {
         if mant == 0 {
             sign << 31
         } else {
-            // subnormal: value = mant × 2^-24 — نُطبّع: نزيح حتى البت 10 (0x400)
+            // subnormal: value = mant × 2^-24 — normalize: shift until bit 10 (0x400)
             let mut s = 0u32;
             let mut m = mant;
             while m & 0x0400 == 0 {
                 m <<= 1;
                 s += 1;
             }
-            // القيمة = 1.f × 2^(10 - s - 24) → حقل الأس = 127 + 10 - s - 24
+            // value = 1.f × 2^(10 - s - 24) → exponent field = 127 + 10 - s - 24
             let e32 = 127u32 + 10 - s - 24;
             ((sign as u32) << 31) | (e32 << 23) | (((m & 0x03FF) as u32) << 13)
         }
@@ -47,7 +47,7 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-// ---------- get_scale_min_k4 (مصدر: ggml-quants.c:889) ----------
+// ---------- get_scale_min_k4 (source: ggml-quants.c:889) ----------
 
 #[inline]
 fn get_scale_min_k4(j: usize, q: &[u8]) -> (f32, f32) {
@@ -61,9 +61,9 @@ fn get_scale_min_k4(j: usize, q: &[u8]) -> (f32, f32) {
     (d as f32, m as f32)
 }
 
-// ---------- dequant_row: كتلة واحدة → 256 قيمة f32 ----------
+// ---------- dequant_row: one block → 256 f32 values ----------
 
-/// يفك كتلة واحدة (values_per_block قيمة) في buf
+/// Dequantizes one block (values_per_block values) into buf
 pub fn dequant_block(ty: GgmlType, b: &[u8], out: &mut [f32]) {
     match ty {
         GgmlType::F32 => {
@@ -213,7 +213,7 @@ pub fn dequant_block(ty: GgmlType, b: &[u8], out: &mut [f32]) {
                 }
             }
         }
-        other => unimplemented!("quant type {other:?} غير مدعوم بعد"),
+        other => unimplemented!("quant type {other:?} not yet supported"),
     }
 }
 
@@ -225,7 +225,7 @@ pub fn vals_per_block(ty: GgmlType) -> usize {
     }
 }
 
-/// تفكيك عمود كامل من الموتر (n قيمة متتالية على ne[0]) إلى f32
+/// Dequantizes a full column of a tensor (n consecutive values on ne[0]) to f32
 pub fn dequant_slice(ty: GgmlType, data: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0f32; n];
     dequant_into(ty, data, &mut out);
@@ -265,8 +265,8 @@ pub fn dequant_into(ty: GgmlType, data: &[u8], out: &mut [f32]) {
 
 // ---------- matvec: out[o] = dot(x, W[:, o]) ----------
 
-/// حاصل ضرب x × عمود o من موتر مكمّم.
-/// الموتر بترتيب ggml: ne[0]=n_in (متصل)، ne[1]=n_out؛ عمود كامل متتالٍ من n_in قيمة.
+/// Dot product of x × column o of a quantized tensor.
+/// The tensor is in ggml order: ne[0]=n_in (contiguous), ne[1]=n_out; a full column is n_in consecutive values.
 pub fn dot_column(ty: GgmlType, data: &[u8], col: usize, n_in: usize, x: &[f32]) -> f32 {
     match ty {
         GgmlType::F32 => {
@@ -314,8 +314,8 @@ pub fn dot_column(ty: GgmlType, data: &[u8], col: usize, n_in: usize, x: &[f32])
     }
 }
 
-/// matvec كامل متوازٍ على الأعمدة (نواة v0: إلغاء تكميم داخل الحلقة)
-/// `data` شريطة الموتر الكاملة، ne=[n_in, n_out]
+/// Full matvec parallel over columns (v0 kernel: dequantization inside the loop)
+/// `data` is the whole tensor slice, ne=[n_in, n_out]
 pub fn matvec(ty: GgmlType, data: &[u8], n_in: usize, n_out: usize, x: &[f32], n_threads: usize, out: &mut [f32]) {
     let n_threads = n_threads.max(1);
     let chunk = (n_out + n_threads - 1) / n_threads;
@@ -336,7 +336,7 @@ pub fn matvec(ty: GgmlType, data: &[u8], n_in: usize, n_out: usize, x: &[f32], n
     });
 }
 
-/// جلب عمود كامل فك تكميمه (مفيد للموارد الصغيرة: norms, conv kernel)
+/// Fetch and dequantize a full column (useful for small weights: norms, conv kernel)
 pub fn column_f32(ty: GgmlType, data: &[u8], col: usize, n: usize) -> Vec<f32> {
     match ty {
         GgmlType::F32 => {
@@ -372,7 +372,7 @@ pub fn column_f32(ty: GgmlType, data: &[u8], col: usize, n: usize) -> Vec<f32> {
     }
 }
 
-/// تفكيك متجه أوزان [n] كامل (norms مثلاً) — موتر أحادي البعد
+/// Dequantize a whole [n] weight vector (e.g. norms) — one-dimensional tensor
 pub fn weights1d(ty: GgmlType, data: &[u8], n: usize) -> Vec<f32> {
     let n_eff = if n % 256 != 0 && n < 256 { n } else { n };
     match ty {
@@ -400,7 +400,7 @@ pub fn weights1d(ty: GgmlType, data: &[u8], n: usize) -> Vec<f32> {
         _ => {
             let vpb = vals_per_block(ty);
             if n_eff % vpb != 0 {
-                // أبعاد غير من مضاعفات 256 نادرة؛ نستخدم dequant_to مع تمدد
+                // dims that are not multiples of 256 are rare; use dequant_into with padding
                 let padded = n_eff.div_ceil(vpb) * vpb;
                 let mut out = vec![0f32; padded];
                 dequant_into(ty, data, &mut out);

@@ -1,4 +1,4 @@
-//! llama-core — محرك الاستدلال (نقلة Rust لسلوك llama.cpp b12502)
+//! llama-core — the inference engine (Rust port of llama.cpp b12502 behavior)
 pub mod model;
 pub mod tokenizer;
 pub mod sampler;
@@ -6,7 +6,7 @@ pub mod chat;
 
 use llama_gguf::{GgmlType, GgufFile, TensorInfo};
 
-/// مرجع موتر أوزان [n_in, n_out] بترتيب ggml (عمود خروج = n_in قيمة متتالية)
+/// Weight-tensor reference [n_in, n_out] in ggml order (output column = n_in consecutive values)
 pub struct W<'a> {
     pub ty: GgmlType,
     pub data: &'a [u8],
@@ -15,7 +15,7 @@ pub struct W<'a> {
 }
 
 impl<'a> W<'a> {
-    /// جلب موتر بالاسم من الملف (dims [n_in, n_out])
+    /// Fetch a tensor by name from the file (dims [n_in, n_out])
     pub fn get(gguf: &'a GgufFile, name: &str) -> W<'a> {
         let t: &TensorInfo = gguf.tensor(name)
             .unwrap_or_else(|| panic!("missing tensor: {name}"));
@@ -27,19 +27,19 @@ impl<'a> W<'a> {
             n_out: t.dims[1] as usize,
         }
     }
-    /// matvec متوازٍ: out[o] = Σ_i x[i]·W[i,o]
+    /// Parallel matvec: out[o] = Σ_i x[i]·W[i,o]
     pub fn matvec(&self, x: &[f32], out: &mut [f32], n_threads: usize) {
         debug_assert_eq!(x.len(), self.n_in);
         debug_assert_eq!(out.len(), self.n_out);
         llama_quant::matvec(self.ty, self.data, self.n_in, self.n_out, x, n_threads, out);
     }
-    /// عمود واحد (مفيد للـ embedding lookup: عمود token_id)
+    /// One column (useful for the embedding lookup: column token_id)
     pub fn column(&self, col: usize, n: usize) -> Vec<f32> {
         llama_quant::column_f32(self.ty, self.data, col, n)
     }
 }
 
-/// موتر أحادي البعد [n] → أوزان f32
+/// One-dimensional tensor [n] → f32 weights
 pub fn weights1d(gguf: &GgufFile, name: &str) -> Vec<f32> {
     let t = gguf.tensor(name).unwrap_or_else(|| panic!("missing tensor: {name}"));
     assert_eq!(t.dims.len(), 1, "{name} dims {:?}", t.dims);
@@ -47,7 +47,7 @@ pub fn weights1d(gguf: &GgufFile, name: &str) -> Vec<f32> {
     llama_quant::weights1d(t.ty, gguf.tensor_bytes(t), n)
 }
 
-// ---------- ops (نفس معادلات ggml-cpu/ops.cpp) ----------
+// ---------- ops (same formulas as ggml-cpu/ops.cpp) ----------
 
 /// RMSNorm: x * w / sqrt(mean(x²)+eps)  [ggml_compute_forward_rms_norm]
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
@@ -64,7 +64,7 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x as f64).exp()) as f32
 }
 
-/// softmax مستقرة
+/// Stable softmax
 pub fn softmax_inplace(x: &mut [f32]) {
     let mut max = f32::NEG_INFINITY;
     for v in x.iter() { if *v > max { max = *v; } }
@@ -89,13 +89,13 @@ pub fn swiglu_ffn(down: &W, gate_out: &[f32], up_out: &[f32], scratch: &mut Vec<
     out
 }
 
-/// RoPE NeoX مع عوامل تردد اختيارية (نقل ggml-cpu/ops.cpp:6148-6252):
-/// angle_j = pos · base^(−2j/d) / ff_j، أزواج (j, j+d/2)
-/// يعمل على vec كامل مقسّم رؤوساً [n_head][head_dim]
+/// NeoX RoPE with optional frequency factors (port of ggml-cpu/ops.cpp:6148-6252):
+/// angle_j = pos · base^(−2j/d) / ff_j, pairs (j, j+d/2)
+/// Operates on a whole vec split into heads [n_head][head_dim]
 pub fn rope_neox_inplace(heads: &mut [f32], pos: usize, base: f64, factors: Option<&[f32]>) {
-    let d = heads.len(); // head_dim (مشرق على رأس واحد)
+    let d = heads.len(); // head_dim (this operates on a single head)
     let half = d / 2;
-    // theta_scale = base^(-2/d)؛ theta_j = pos·base^(-2j/d)
+    // theta_scale = base^(-2/d); theta_j = pos·base^(-2j/d)
     let theta_scale = base.powf(-2.0 / d as f64);
     let mut theta = pos as f64;
     for j in 0..half {
@@ -110,15 +110,15 @@ pub fn rope_neox_inplace(heads: &mut [f32], pos: usize, base: f64, factors: Opti
     }
 }
 
-/// softmax مصفوفة scores مع قناع (causal و/أو SWA) ثم ترجيح القيم
-/// يعيد المخرج الناتج لرأس واحد
+/// Softmax over the score vector with a mask (causal and/or SWA), then value weighting
+/// Returns the resulting output for one head
 pub fn attention_one_head(
     q: &[f32],            // head_dim
-    k_all: &[f32],        // [n_kv, head_dim] (رأس kv واحد)
+    k_all: &[f32],        // [n_kv, head_dim] (one kv head)
     v_all: &[f32],
     n_kv: usize,
     head_dim: usize,
-    swa_window: Option<usize>, // None = causal كامل
+    swa_window: Option<usize>, // None = fully causal
     out: &mut [f32],
     scratch_scores: &mut Vec<f32>,
 ) {
@@ -132,9 +132,9 @@ pub fn attention_one_head(
         }
         scratch_scores.push(dot * scale);
     }
-    // القناع: causal (كل المواضع هنا ≤ pos لأن KV ينمو) + نافذة SWA
+    // mask: causal (all positions here ≤ pos because KV grows) + SWA window
     if let Some(w) = swa_window {
-        // مسموح p >= pos-(w-1)؛ pos الحالي = n_kv-1
+        // allowed p >= pos-(w-1); current pos = n_kv-1
         let pos = n_kv - 1;
         let lo = pos.saturating_sub(w - 1);
         for (p, s) in scratch_scores.iter_mut().enumerate() {

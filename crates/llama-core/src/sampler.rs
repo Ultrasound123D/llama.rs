@@ -1,8 +1,8 @@
-//! أخذ العينات — نقل llama-sampling.cpp الأساسي: greedy/temperature/top-k/top-p
+//! Sampling — port of the core of llama-sampling.cpp: greedy/temperature/top-k/top-p
 pub struct SamplerCfg {
     pub temp: f32,
-    pub top_k: usize,   // 0 = الكل
-    pub top_p: f32,     // 1.0 = الكل
+    pub top_k: usize,   // 0 = all
+    pub top_p: f32,     // 1.0 = all
     pub seed: u64,
 }
 
@@ -10,7 +10,7 @@ impl Default for SamplerCfg {
     fn default() -> Self { SamplerCfg { temp: 0.0, top_k: 0, top_p: 1.0, seed: 42 } }
 }
 
-/// عينة توكن واحدة من logits (temp=0 → greedy argmax)
+/// Sample one token from logits (temp=0 → greedy argmax)
 pub fn sample(logits: &[f32], cfg: &SamplerCfg, rng: &mut SimpleRng) -> u32 {
     if cfg.temp <= 1e-6 {
         // greedy
@@ -57,7 +57,7 @@ pub fn sample(logits: &[f32], cfg: &SamplerCfg, rng: &mut SimpleRng) -> u32 {
     probs.last().map(|p| p.0 as u32).unwrap_or(0)
 }
 
-/// مولد عشوائي بسيط (xorshift64*)
+/// Simple random generator (xorshift64*)
 pub struct SimpleRng { state: u64 }
 impl SimpleRng {
     pub fn new(seed: u64) -> SimpleRng { SimpleRng { state: seed.max(1) } }

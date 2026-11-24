@@ -1,4 +1,4 @@
-//! اختبار فك التكميم على كتل اصطناعية بقيم محسوبة يدوياً + تحويلات f16/BF16
+//! Dequantization test on synthetic blocks with hand-computed values + f16/BF16 conversions
 use llama_gguf::GgmlType;
 use llama_quant::{bf16_to_f32, dequant_into, f16_to_f32};
 
@@ -16,8 +16,8 @@ fn f16_bf16_conversions() {
 
 #[test]
 fn dequant_q4_0_synth() {
-    // كتلة واحدة: d = f16(1.0)، qs[j] = 0x21 → منخفض=1، مرتفع=2
-    // → القيم (1-8)×1.0 و (2-8)×1.0
+    // one block: d = f16(1.0), qs[j] = 0x21 → low nibble=1, high nibble=2
+    // → values (1-8)×1.0 and (2-8)×1.0
     let mut data = Vec::new();
     data.extend_from_slice(&0x3C00u16.to_le_bytes());
     for _ in 0..16 {
@@ -61,7 +61,7 @@ fn dequant_f32_passthrough() {
 
 #[test]
 fn dequant_f16_synth() {
-    // f16(1.0) = 0x3C00، f16(0.5) = 0x3800
+    // f16(1.0) = 0x3C00, f16(0.5) = 0x3800
     let mut data = Vec::new();
     data.extend_from_slice(&0x3C00u16.to_le_bytes());
     data.extend_from_slice(&0x3800u16.to_le_bytes());

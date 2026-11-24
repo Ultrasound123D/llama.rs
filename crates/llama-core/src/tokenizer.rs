@@ -1,15 +1,15 @@
-//! BPE tokenizer — نقل llama-vocab.cpp (llm_tokenizer_bpe) + unicode.cpp:
-//! - pre "lfm2"/"llama3" → LLAMA3 pre: آلة حالات unicode.cpp:355 (نقل حرفي)
-//! - ترميز GPT-2 البايتي (unicode.cpp:157)
-//! - BPE merges برتب الأولوية (llama-vocab.cpp:752)
-//! - ignore_merges: كلمة pre-token إن وُجدت توكناً كاملاً → id مباشر (llama-vocab.cpp:724)
-//! - تقسيم حول special tokens (fragmentation) ثم BPE للبقية
-//! - detokenize مع فك ترميز البايتات
+//! BPE tokenizer — port of llama-vocab.cpp (llm_tokenizer_bpe) + unicode.cpp:
+//! - pre "lfm2"/"llama3" → LLAMA3 pre: the state machine of unicode.cpp:355 (verbatim port)
+//! - GPT-2 byte encoding (unicode.cpp:157)
+//! - BPE merges by priority rank (llama-vocab.cpp:752)
+//! - ignore_merges: a pre-token word found as a whole token → direct id (llama-vocab.cpp:724)
+//! - splitting around special tokens (fragmentation), then BPE for the rest
+//! - detokenize with byte decoding
 use llama_gguf::{GgufFile, Value};
 use std::collections::HashMap;
 use unicode_general_category::{GeneralCategory, get_general_category};
 
-/// \p{L} = \{Lu,Ll,Lt,Lm,Lo\}، \p{N} = \{Nd,Nl,No\}، \s = White_Space (unicode.h)
+/// \p{L} = \{Lu,Ll,Lt,Lm,Lo\}, \p{N} = \{Nd,Nl,No\}, \s = White_Space (unicode.h)
 fn is_letter(c: char) -> bool {
     matches!(get_general_category(c),
         GeneralCategory::UppercaseLetter | GeneralCategory::LowercaseLetter
@@ -21,13 +21,13 @@ fn is_number(c: char) -> bool {
         GeneralCategory::DecimalNumber | GeneralCategory::LetterNumber | GeneralCategory::OtherNumber)
 }
 fn is_ws(c: char) -> bool { c.is_whitespace() }
-/// كل حرف معرف له أعلام في جداول llama.cpp عملياً (flags.as_uint() != 0)
+/// practically, every assigned character has flags in the llama.cpp tables (flags.as_uint() != 0)
 fn has_flags(c: char) -> bool {
     !matches!(get_general_category(c), GeneralCategory::Unassigned)
 }
 fn tolower(c: char) -> char { c.to_lowercase().next().unwrap_or(c) }
 
-/// جدول ترميز GPT-2 البايتي (unicode.cpp:157)
+/// GPT-2 byte-encoding table (unicode.cpp:157)
 fn byte_encode_table() -> [char; 256] {
     let mut map = ['\0'; 256];
     let mut n = 0u32;
@@ -41,7 +41,7 @@ fn byte_encode_table() -> [char; 256] {
 
 pub struct BpeTokenizer {
     pub tokens: Vec<String>,
-    pub token_type: Vec<u8>, // 1 normal، 2 unknown، 3 control، 4 user_defined، 5 unused، 6 byte
+    pub token_type: Vec<u8>, // 1 normal, 2 unknown, 3 control, 4 user_defined, 5 unused, 6 byte
     pub token_to_id: HashMap<String, u32>,
     /// (left_id, right_id) → (rank, merged_id)
     pub merges: HashMap<(u32, u32), (u32, u32)>,
@@ -49,7 +49,7 @@ pub struct BpeTokenizer {
     byte_unmap: HashMap<char, u8>,
     pub bos_id: u32, pub eos_id: u32,
     pub add_bos: bool, pub add_eos: bool,
-    /// special = نوع ≠ normal (نفس منطق llama.cpp)
+    /// special = type ≠ normal (same logic as llama.cpp)
     pub special: Vec<(String, u32)>,
 }
 
@@ -107,7 +107,7 @@ impl BpeTokenizer {
         s.bytes().map(|b| self.byte_map[b as usize]).collect()
     }
 
-    // -------- تقسيم llama3-pre (نقل حرفي unicode.cpp:355-493) --------
+    // -------- llama3-pre split (verbatim port of unicode.cpp:355-493) --------
     fn split_llama3(&self, text: &str) -> Vec<String> {
         let cpts: Vec<char> = text.chars().collect();
         let n = cpts.len();
@@ -221,16 +221,16 @@ impl BpeTokenizer {
                 continue;
             }
 
-            // لا تطابق: حرف واحد
+            // no match: single character
             pos += 1;
             add_token!(pos);
         }
         words
     }
 
-    // -------- BPE لجزء (llama-vocab.cpp:716-820) --------
+    // -------- BPE for one segment (llama-vocab.cpp:716-820) --------
     fn bpe_word(&self, word: &str) -> Vec<u32> {
-        // ignore_merges: الكلمة الكاملة في القاموس → id مباشر
+        // ignore_merges: the whole word in the dictionary → direct id
         if let Some(&id) = self.token_to_id.get(word) {
             return vec![id];
         }
@@ -274,13 +274,13 @@ impl BpeTokenizer {
         out
     }
 
-    /// توكنِزة مع special-token fragmentation (مثل llama_tokenize special=true)
+    /// Tokenize with special-token fragmentation (like llama_tokenize special=true)
     pub fn tokenize(&self, text: &str, add_bos: Option<bool>, add_eos: bool) -> Vec<u32> {
         let mut ids = Vec::new();
         if add_bos.unwrap_or(self.add_bos) { ids.push(self.bos_id); }
         let mut rest = text.to_string();
         loop {
-            // أول ظهور لأي special token (الأطول عند التعادل)
+            // first occurrence of any special token (longest on ties)
             let mut best: Option<(usize, &str, u32)> = None;
             for (stext, sid) in self.special.iter() {
                 if stext.is_empty() || stext.len() > rest.len() { continue; }
@@ -313,7 +313,7 @@ impl BpeTokenizer {
         ids
     }
 
-    /// BPE فقط (llama_tokenize special=false)
+    /// BPE only (llama_tokenize special=false)
     pub fn tokenize_plain(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
         for w in self.split_llama3(text) {
@@ -323,7 +323,7 @@ impl BpeTokenizer {
         ids
     }
 
-    /// فك توكنة: normal → فك ترميز بايتي؛ خاص → خام
+    /// Detokenize one token: normal → byte-decode; special → raw
     pub fn detokenize_one(&self, id: u32) -> String {
         let text = match self.tokens.get(id as usize) {
             Some(t) => t.clone(),

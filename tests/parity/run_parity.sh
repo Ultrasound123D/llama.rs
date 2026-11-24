@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================
-# اختبارات تطابق llama.rs مع llama.cpp (Golden Reference)
-# يتطلب: llama.cpp binaries + llama.rs مبنية + النماذج
-# الاستخدام: bash tests/parity/run_parity.sh [port_qwen] [port_lfm3]
-# مسارات قابلة للتجاوز بمتغيرات البيئة:
-#   LLAMA_BIN (مجلد binaries llama.cpp) / LLAMA_RS / QWEN / LFM
+# llama.rs parity tests against llama.cpp (golden reference)
+# Requires: llama.cpp binaries + llama.rs built + the models
+# Usage: bash tests/parity/run_parity.sh [port_qwen] [port_lfm3]
+# Paths overridable via environment variables:
+#   LLAMA_BIN (llama.cpp binaries dir) / LLAMA_RS / QWEN / LFM
 # =============================================================
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,13 +21,13 @@ check() { # name, ok
   if [ "$2" = "1" ]; then pass=$((pass+1)); echo "  PASS  $1"; else fail=$((fail+1)); echo "  FAIL  $1"; fi
 }
 
-echo "== [1] توكنِنة: llama.rs vs llama.cpp /tokenize (نصوص عربية/إنجليزية/رموز) =="
+echo "== [1] tokenize: llama.rs vs llama.cpp /tokenize (mixed-script/English/symbols) =="
 declare -a TEXTS=(
   "Hello world"
-  "الذكاء الاصطناعي علم يهتم ببناء أنظمة ذكية"
+  "人工智能是一门构建智能系统的科学"
   "The quick brown fox jumps over 42 lazy dogs!"
-  "عدد 123 وأرقام 9876543 ورموز !@#\$%^&*"
-  "mixed نص عربي مع English words and 42 numbers"
+  "count 123 and numbers 9876543 with symbols !@#\$%^&*"
+  "mixed 中文 with English words and 42 numbers"
 )
 for model in "$QWEN" "$LFM"; do
   name=$(basename "$model")
@@ -42,7 +42,7 @@ for model in "$QWEN" "$LFM"; do
   pkill -f "llama-server.*port $port" 2>/dev/null; sleep 2
 done
 
-echo "== [2] التوزيع بعد prefill: تطابق top-1 مع llama.cpp (greedy) =="
+echo "== [2] distribution after prefill: top-1 match with llama.cpp (greedy) =="
 for model in "$QWEN" "$LFM"; do
   name=$(basename "$model")
   port=$PORT2
@@ -56,11 +56,11 @@ for model in "$QWEN" "$LFM"; do
   pkill -f "llama-server.*port $port" 2>/dev/null; sleep 2
 done
 
-echo "== [3] فك التكميم: llama.rs vs مرجع C (كود ggml الأصلي) =="
+echo "== [3] dequantization: llama.rs vs C reference (original ggml code) =="
 gcc -O2 -o /tmp/ref_q5 "$SCRIPT_DIR/ref_q5.c"
 gcc -O2 -o /tmp/ref_q6 "$SCRIPT_DIR/ref_q6.c"
 
-# Q5_0 — عمود 785 من token_embd.weight في Qwen (الإزاحة تُستخرج آلياً من dumpcol)
+# Q5_0 — column 785 of token_embd.weight in Qwen (offset extracted automatically by dumpcol)
 "$EXAMPLES/dumpcol" "$QWEN" token_embd.weight 785 2>/tmp/meta_q5.txt >/tmp/rs_q5.txt
 off=$(grep -o 'offset_in_file=[0-9]*' /tmp/meta_q5.txt | head -1 | cut -d= -f2)
 cb=$(grep -o 'col_bytes=[0-9]*' /tmp/meta_q5.txt | head -1 | cut -d= -f2)
@@ -69,9 +69,9 @@ awk '{print $2}' /tmp/rs_q5.txt > /tmp/rs_q5_vals.txt
 /tmp/ref_q5 "$QWEN" "$col_off" "$cb" | tr ' ' '\n' > /tmp/c_q5_vals.txt
 maxd=$(paste /tmp/rs_q5_vals.txt /tmp/c_q5_vals.txt | awk '{d=$1-$2; if(d<0)d=-d; if(d>m)m=d} END {print m+0}')
 ok=$(python3 -c "print(1 if float('$maxd') < 1e-6 else 0)")
-check "dequant Q5_0 عمود 785 من token_embd (max diff=$maxd)" $ok
+check "dequant Q5_0 column 785 of token_embd (max diff=$maxd)" $ok
 
-# Q6_K — عمود 0 من blk.0.ffn_down.weight في Qwen
+# Q6_K — column 0 of blk.0.ffn_down.weight in Qwen
 "$EXAMPLES/dumpcol" "$QWEN" blk.0.ffn_down.weight 0 2>/tmp/meta_q6.txt >/tmp/rs_q6.txt
 off=$(grep -o 'offset_in_file=[0-9]*' /tmp/meta_q6.txt | head -1 | cut -d= -f2)
 cb=$(grep -o 'col_bytes=[0-9]*' /tmp/meta_q6.txt | head -1 | cut -d= -f2)
@@ -79,9 +79,9 @@ awk '{print $2}' /tmp/rs_q6.txt > /tmp/rs_q6_vals.txt
 /tmp/ref_q6 "$QWEN" "$off" "$cb" | tr ' ' '\n' > /tmp/c_q6_vals.txt
 maxd=$(paste /tmp/rs_q6_vals.txt /tmp/c_q6_vals.txt | awk '{d=$1-$2; if(d<0)d=-d; if(d>m)m=d} END {print m+0}')
 ok=$(python3 -c "print(1 if float('$maxd') < 1e-6 else 0)")
-check "dequant Q6_K عمود 0 من blk.0.ffn_down (max diff=$maxd)" $ok
+check "dequant Q6_K column 0 of blk.0.ffn_down (max diff=$maxd)" $ok
 
 echo ""
 echo "======================================"
-echo "النتيجة: PASS=$pass FAIL=$fail"
-[ $fail -eq 0 ] && echo "كل اختبارات التطابق ناجحة" || echo "راجع الإخفاقات أعلاه"
+echo "Result: PASS=$pass FAIL=$fail"
+[ $fail -eq 0 ] && echo "All parity tests passed" || echo "Review the failures above"

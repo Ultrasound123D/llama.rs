@@ -1,5 +1,5 @@
-// اختبار تطابق فك التكميم مع المرجع C (ggml الأصلي)
-// قراءة عمود من موتر ومقارنة القيم
+// Parity test of dequantization against the C reference (original ggml code)
+// Reads one column of a tensor and compares the values
 use llama_gguf::GgufFile;
 use llama_quant::column_f32;
 

@@ -1,7 +1,7 @@
-//! اختبار اصطناعي: بناء ملف GGUF v3 صغير ثم قراءته والتحقق من كل الحقول.
-//! يغطي: كل أنواع KV (بما فيها سلسلة عربية ومصفوفة)، أبعاد التوترات بترتيب ne
-//! مباشرة (كما gguf.cpp:1550 يكتب info.t.ne[j])، محاذاة 32 لمنطقة البيانات،
-//! حساب الإزاحات المتتابعة، ووصول البايتات الخام.
+//! Synthetic test: build a small GGUF v3 file, then read it back and verify every field.
+//! Covers: all KV types (including a non-ASCII UTF-8 string and an array), tensor dims in ne
+//! order directly (as gguf.cpp:1550 writes info.t.ne[j]), 32-byte data-region alignment,
+//! sequential offset computation, and raw byte access.
 use llama_gguf::{GgmlType, GgufFile, Value};
 
 fn u32b(v: u32) -> [u8; 4] { v.to_le_bytes() }
@@ -23,10 +23,10 @@ fn build_gguf() -> Vec<u8> {
     put_str(&mut b, "general.architecture");
     b.extend_from_slice(&u32b(8));
     put_str(&mut b, "test");
-    // KV 2: اسم عربي (تحقق UTF-8)
+    // KV 2: non-ASCII UTF-8 name (UTF-8 check)
     put_str(&mut b, "general.name");
     b.extend_from_slice(&u32b(8));
-    put_str(&mut b, "اختبار عربي");
+    put_str(&mut b, "café 東京");
     // KV 3: test.block_count = 1 (u32)
     put_str(&mut b, "test.block_count");
     b.extend_from_slice(&u32b(4));
@@ -39,11 +39,11 @@ fn build_gguf() -> Vec<u8> {
     put_str(&mut b, "general.custom_bool");
     b.extend_from_slice(&u32b(7));
     b.push(1);
-    // KV 6: مصفوفة u32
+    // KV 6: u32 array
     put_str(&mut b, "general.custom_arr");
     b.extend_from_slice(&u32b(9)); // array
-    b.extend_from_slice(&u32b(4)); // عنصر u32
-    b.extend_from_slice(&u64b(3)); // عدد
+    b.extend_from_slice(&u32b(4)); // u32 element
+    b.extend_from_slice(&u64b(3)); // count
     for v in [1u32, 2, 3] {
         b.extend_from_slice(&u32b(v));
     }
@@ -52,7 +52,7 @@ fn build_gguf() -> Vec<u8> {
     b.extend_from_slice(&u32b(10));
     b.extend_from_slice(&u64b(1 << 40));
 
-    // جدول التوترات (dims بترتيب ne مباشرة)
+    // tensor table (dims in direct ne order)
     // t0: emb.weight F32 [ne=4, 2]
     put_str(&mut b, "emb.weight");
     b.extend_from_slice(&u32b(2));
@@ -68,16 +68,16 @@ fn build_gguf() -> Vec<u8> {
     b.extend_from_slice(&u32b(2)); // Q4_0
     b.extend_from_slice(&u64b(0)); // offset
 
-    // محاذاة 32 لمنطقة البيانات (GGUF_ALIGNMENT)
+    // 32-byte alignment for the data region (GGUF_ALIGNMENT)
     while b.len() % 32 != 0 {
         b.push(0);
     }
 
-    // بيانات t0: 8 قيم f32
+    // t0 data: 8 f32 values
     for i in 1..=8i32 {
         b.extend_from_slice(&(i as f32).to_le_bytes());
     }
-    // بيانات t1: كتلة Q4_0 واحدة: d=f16(1.0)=0x3C00 + qs[16]=0x21
+    // t1 data: one Q4_0 block: d=f16(1.0)=0x3C00 + qs[16]=0x21
     b.extend_from_slice(&0x3C00u16.to_le_bytes());
     for _ in 0..16 {
         b.push(0x21);
@@ -92,14 +92,14 @@ fn synthetic_gguf_roundtrip() {
 
     let f = GgufFile::open(path.to_str().unwrap()).unwrap();
 
-    // الميتاداتا
+    // metadata
     assert_eq!(f.version, 3);
     assert_eq!(f.arch(), Some("test"));
     assert_eq!(
         f.metadata.get("general.name").and_then(|v| v.as_str()),
-        Some("اختبار عربي")
+        Some("café 東京")
     );
-    // get_meta يحلّ بالمعمارية أولاً (test.block_count)
+    // get_meta resolves by architecture first (test.block_count)
     assert_eq!(f.get_meta("block_count").and_then(|v| v.as_u64()), Some(1));
     assert_eq!(f.metadata.get("general.custom_f64"), Some(&Value::F64(1.5)));
     assert_eq!(f.metadata.get("general.custom_bool"), Some(&Value::Bool(true)));
@@ -115,7 +115,7 @@ fn synthetic_gguf_roundtrip() {
         .collect();
     assert_eq!(arr, vec![1, 2, 3]);
 
-    // التوترات
+    // tensors
     assert_eq!(f.tensors.len(), 2);
     let t0 = f.tensor("emb.weight").unwrap();
     assert_eq!(t0.dims, vec![4, 2]);
@@ -124,21 +124,21 @@ fn synthetic_gguf_roundtrip() {
     assert_eq!(t1.dims, vec![32, 1]);
     assert_eq!(t1.ty, GgmlType::Q4_0);
 
-    // الإزاحات: المنطقة محاذاة، t0 عند 0 (32 بايت)، t1 عند 32 (18 بايت)
+    // offsets: region aligned, t0 at 0 (32 bytes), t1 at 32 (18 bytes)
     assert_eq!(f.data_start % 32, 0);
     assert!(f.data_start > 0);
     assert_eq!(t0.offset, 0);
     assert_eq!(t1.offset, 32);
     assert_eq!(f.n_bytes_total(), 32 + 18);
 
-    // بايتات t0 = القيم الثماني نفسها
+    // t0 bytes = the same 8 values
     let b0 = f.tensor_bytes(t0);
     assert_eq!(b0.len(), 32);
     for i in 0..8 {
         let v = f32::from_le_bytes([b0[4 * i], b0[4 * i + 1], b0[4 * i + 2], b0[4 * i + 3]]);
         assert_eq!(v, (i + 1) as f32);
     }
-    // بايتات t1: f16(1.0) ثم 0x21
+    // t1 bytes: f16(1.0) then 0x21
     let b1 = f.tensor_bytes(t1);
     assert_eq!(b1.len(), 18);
     assert_eq!(u16::from_le_bytes([b1[0], b1[1]]), 0x3C00);
