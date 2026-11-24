@@ -13,7 +13,7 @@
 | GGUF reader | `ggml/src/gguf.cpp`, `ggml-common.h` | `crates/llama-gguf` | unchanged |
 | Tensor types/quant blocks | `ggml-common.h` (block_q*_K) | `crates/llama-quant` | unchanged |
 | Compute ops | `ggml/src/ggml-cpu/ops.cpp` | `llama-core` (lib.rs ops + quant matvec) | `crates/llama-kernels` + SIMD — **done in Phase 6** |
-| Compute kernels (SIMD) | `ggml/src/ggml-cpu/arch/x86/quants.c` + `vec.cpp` | `crates/llama-kernels/src/avx2.rs` (+ `avx512.rs` experiment) | same (AMX not ported) |
+| Compute kernels (SIMD) | `ggml/src/ggml-cpu/arch/x86/quants.c` + `vec.cpp` | `crates/llama-kernels/src/avx2.rs` (+ `avx512.rs` experiment) | same + `vnni.rs` (repacked AVX-512 VNNI INT8, Phase 6.3; **AMX tile instructions not executed** — capability detection only) |
 | Activation quantizers | `ggml-quants.c quantize_row_q8_0/q8_K` + arch/x86 fast path | `crates/llama-kernels/src/quant.rs` | unchanged |
 | Threadpool | `ggml/src/ggml-cpu/ggml-cpu.c` (ggml_threadpool) | `crates/llama-kernels/src/pool.rs` (persistent workers, spin-then-park) | unchanged |
 | Backend/scheduling | `ggml/src/ggml-backend.cpp` | — (not needed for CPU in v0) | `crates/llama-backend` |
@@ -91,7 +91,7 @@ llama.rs/
 | P4 tokenizer | tokenizing mixed-script/English/symbols texts: ids match llama.cpp `/tokenize` 100% | **complete: 10/10 checks = 100% ids** |
 | P5 first model | Qwen2.5-0.5B: greedy text identical to `llama-completion` (same seed/temp=0) | **complete**: the first 14 tokens match literally; afterwards near-perfect numerical parity (gaps < 0.1 logprob) that flips candidate order — requires the ggml kernels (P6) |
 | P5+ reference model | LFM3-1.7B: same Qwen gate + hybrid structure (conv + SWA + head gate + learned rope) | **complete**: top-1 greedy match on ×2 prompts; a full chat answer byte-identical to llama.cpp's |
-| P6 CPU SIMD | benchmark against llama-bench on the same machine | **complete**: LFM3-1.7B 0.9 → **8.7 tok/s (~10×)**, 2 threads, vs llama.cpp 11.9 (AVX-512 build). Kernel rate 13.9–16.8 GB/s DRAM (Q4_K/Q6_K); parity gates 16/16 still green. Findings: software prefetch was worth +53%; AVX-512 VNNI kernel ~9% slower on this VM (kept as experiment); remaining Qwen gap = llama.cpp's AMX tiles (unported) |
+| P6 CPU SIMD | benchmark against llama-bench on the same machine | **complete**: LFM3-1.7B 0.9 → **8.7 tok/s (~10×)**, 2 threads, vs llama.cpp 11.9 (AVX-512 build). Kernel rate 13.9–16.8 GB/s DRAM (Q4_K/Q6_K); parity gates 16/16 still green. Findings: software prefetch was worth +53%; AVX-512 VNNI kernel ~9% slower on this VM (kept as experiment); remaining Qwen decode gap = llama.cpp's repacked-VNNI simple-quant route (ported in 6.3, see addendum) |
 | P7 server/parallelism | OpenAI API + streaming + batching | planned |
 | P8 architecture expansion | llama3/gemma/qwen3… | planned |
 
@@ -106,9 +106,10 @@ llama.rs/
 
 ## 6) v0 Limits (not yet ported — with full honesty)
 
-- Throughput: LFM3-1.7B 8.7 tok/s vs llama.cpp 11.9 on this VM (the remaining gap is inter-matvec scheduling, not kernel streaming rate); Qwen2.5-0.5B 8.8 vs 31.6 — llama.cpp's simple-quant tensors run on **AMX tile kernels** (its sapphirerapids backend) which are not ported.
+- Throughput (matched 2-thread benchmark, medians): LFM3-1.7B decode 8.5 vs llama.cpp 11.8 tok/s (72%); Qwen2.5-0.5B decode 23.6 vs 29.7 (80%). Prefill, measured separately: llama.rs 8.8 / 24.8 vs llama.cpp 99.8 / 159.8 tok/s — llama.rs prefills token-by-token while llama.cpp batches the whole prompt (M>1, where its real AMX tile kernels run); batched prefill is the largest remaining gap.
+- llama.cpp's simple-quant decode tensors (Q8_0 head, Q5_0 attn) run on its AMX backend's **repacked-VNNI M=1 route** — not on tile instructions; that route is now ported here (`llama-kernels/src/vnni.rs`).
 - No HTTP server, no parallel batching, no speculative decoding (Phase 7).
-- No GPU backends. No AMX.
+- No GPU backends. No AMX tile instructions executed (CPUID/XCR0 capability is detected and reported only).
 - Chat template subset (not full jinja): ChatML + LFM3 thinking tags, no tools/vision.
 - Supported architectures: lfm3 + the llama family (llama1/2/3, qwen2, qwen2.5 through the llama-family model). The rest in P8.
 - Licensing note: MIT (llama.cpp) — copyright notices in the NOTICE file in the repo; ported pieces are documented with their sources in §2.
@@ -135,4 +136,4 @@ Measurements on this VM (2 vCPU Xeon sapphirerapids, 3200 MHz, DRAM ceiling 29 G
 - **Instrumentation**: op-level TSC profiler (`llama-core/src/prof.rs`) + kernel counters (`llama-kernels/src/kstats.rs`) + `kprofile` micro-bench + `scripts/bench_decode.sh`/`profile_decode.sh`. perf_event_open is EPERM in this VM → cycles = invariant TSC; no cache-miss counters (documented in PERFORMANCE_REPORT.md).
 - **Kernels (6.1 finding → fix)**: the simple-quant kernels (Q4_0/Q5_0/Q8_0) ran at 3.4–8.7 GB/s because every 32-value block did two *software* f16→f32 conversions for the scale product. F16C hardware conversion + 2-block unroll: 11.4–14.6 GB/s; Qwen full model 9.5 → 13.1 tok/s.
 - **Scheduling (6.2)**: spin barrier + lock-free job-slot dispatch (`par_chunks2`, generation-counted CAS; `LLAMA_RS_SLOT=0` for A/B) + fused gate+up matvec (`matvec2`: one quantize + one dispatch for both same-input matrices). LFM3 dispatch A/B +14%.
-- **AMX INT8 backend (6.3)**: `llama-kernels/src/amx.rs` — runtime cpuid + XCR0 validation, load-time VNNI repack for Q8_0 (as llama.cpp) and Q5_0 (beyond llama.cpp), decode kernels on 512-bit dpbusd with the exact s8s8 compensation math, per-tensor AVX2 fallback, 5 differential tests. **Qwen2.5-0.5B: 9.5 → 23–26 tok/s (×2.5; llama.cpp 29–30)**. LFM3's tensors are Q4_K/Q6_K (outside the 6.3 type scope) — the K-quant repack is the measured next step and is llama.cpp's remaining LFM3 edge. Full data, failed experiments and gates: PERFORMANCE_REPORT.md.
+- **AVX-512 VNNI INT8 packed backend (6.3)** — *renamed from "AMX INT8 backend" after review (2026-11-25): no AMX tile instruction is executed; the compute is AVX-512 VNNI (`_mm512_dpbusd_epi32`) on load-time-repacked weights, exactly llama.cpp's AMX-backend M=1 decode route*: `llama-kernels/src/vnni.rs` — runtime cpuid + XCR0 validation, load-time VNNI repack for Q8_0 (as llama.cpp) and Q5_0 (beyond llama.cpp), decode kernels on 512-bit dpbusd with the exact s8s8 compensation math, per-tensor AVX2 fallback (`LLAMA_RS_VNNI=0` disables repack for same-binary A/B), 10 differential tests (randomized + edge cases). **Qwen2.5-0.5B decode: 14.1 (AVX2 path) → 23.6 tok/s (+68%) with the packed path, same binary (5-rep A/B); llama.cpp 29.7.** LFM3's tensors are Q4_K/Q6_K (outside the 6.3 type scope; A/B confirmed ~no change for it) — the K-quant repack is the measured next step and is llama.cpp's remaining LFM3 decode edge. Full data, failed experiments and gates: PERFORMANCE_REPORT.md.

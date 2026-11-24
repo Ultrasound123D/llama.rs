@@ -109,8 +109,9 @@ fn main() {
         }
         "bench" => {
             let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
-            let (n_tok, secs) = bench(&mut model, &tokenizer, &ids, n_gen);
-            println!("bench: {n_tok} tokens in {secs:.2}s = {:.2} tok/s", n_tok as f32 / secs);
+            let (n_tok, secs, pp_tok, pp_secs) = bench(&mut model, &tokenizer, &ids, n_gen);
+            println!("bench-pp: {pp_tok} prompt tokens in {pp_secs:.2}s = {:.2} tok/s (prefill)", pp_tok as f32 / pp_secs);
+            println!("bench: {n_tok} tokens in {secs:.2}s = {:.2} tok/s (decode)", n_tok as f32 / secs);
             if prof::prof_enabled() {
                 print_kstats_summary(n_tok);
                 print!("{}", prof::report());
@@ -156,8 +157,13 @@ fn generate_stop(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize, t
     (out_ids, text)
 }
 
-fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize, f32) {
-    // prefill, then time the greedy generation of n tokens
+/// Bench one run: prefill is timed separately from decode (review gate —
+/// "measure prefill and decode separately"). Returns (decode_tokens,
+/// decode_secs, prefill_tokens, prefill_secs).
+fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize, f32, usize, f32) {
+    // prefill, timed separately (includes first-touch page warmup of the
+    // weights; across N process repetitions the median absorbs the cold rep)
+    let tp0 = std::time::Instant::now();
     let mut logits: Vec<f32>;
     {
         let l = forward_token(model, ids[0]);
@@ -167,6 +173,9 @@ fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize
         let l = forward_token(model, id);
         logits = l.to_vec();
     }
+    let pp_secs = tp0.elapsed().as_secs_f32();
+    let pp_tok = ids.len();
+
     let t0 = std::time::Instant::now();
     // separate prefill from decode in the profile: reset all counters now
     prof::reset();
@@ -187,7 +196,7 @@ fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize
     }
     let secs = t0.elapsed().as_secs_f32();
     prof::decode_end(tsc0, count as u64);
-    (count, secs)
+    (count, secs, pp_tok, pp_secs)
 }
 
 fn forward_token(model: &mut Model, token: u32) -> Vec<f32> {

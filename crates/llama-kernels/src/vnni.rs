@@ -1,5 +1,17 @@
-//! AMX INT8 backend (Phase 6.3) — the decode path of llama.cpp's AMX
-//! backend, ported from `ggml/src/ggml-cpu/amx/mmq.cpp` (b12502).
+//! AVX-512 VNNI INT8 packed backend (Phase 6.3) — the M=1 (decode) route
+//! of llama.cpp's AMX backend, ported from `ggml/src/ggml-cpu/amx/mmq.cpp`
+//! (b12502).
+//!
+//! NAMING NOTE (review-driven correction, 2026-11-25): this module was
+//! originally announced as the "AMX INT8 backend". That name was inaccurate
+//! and is corrected here: **no AMX tile instruction (LDTILECFG / TILELOADD /
+//! TDPBUSD / TILEZERO) is executed anywhere in this engine.** The compute
+//! instructions in this module are AVX-512 VNNI (`_mm512_dpbusd_epi32`)
+//! operating on weights repacked at load time. Presence of AMX in CPUID
+//! leaf-7 and XCR0 bits 17/18 is capability *detection*, not execution; the
+//! detection is kept and reported so a future M>1 tile path can be built on
+//! verified ground. AMX tiles pay off only for M>1 (batched prefill), which
+//! this engine does not issue.
 //!
 //! What llama.cpp actually does on this class of CPU for DECODE (M=1):
 //! the "AMX backend" repacks quantized weights at LOAD time into a VNNI
@@ -94,7 +106,7 @@ pub fn detect() -> AmxCaps {
 /// The repacked-VNNI decode kernels need AVX512-VNNI (+VL). AMX tiles are
 /// not used by the M==1 path (they serve M>1 batching); detection and XSTATE
 /// validation are exported for capability reporting and future tiles.
-pub fn amx_path_available() -> bool {
+pub fn vnni_path_available() -> bool {
     static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *A.get_or_init(|| detect().avx512_vnni)
 }
@@ -249,7 +261,7 @@ unsafe fn group_dot_q8_0(q: &[u8], kb: usize, packed: &[u8], group: usize) -> [f
 /// Compute the group band [g_lo, g_hi) of the packed matvec into `out`.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
-unsafe fn amx_band(packed: &[u8], q: &[u8], kb: usize, g_lo: usize, g_hi: usize, out: *mut f32, is_caller: bool) {
+unsafe fn vnni_band(packed: &[u8], q: &[u8], kb: usize, g_lo: usize, g_hi: usize, out: *mut f32, is_caller: bool) {
     let t0 = if kstats::enabled() { kstats::tsc() } else { 0 };
     for g in g_lo..g_hi {
         let r = group_dot_q8_0(q, kb, packed, g);
@@ -267,7 +279,7 @@ unsafe fn amx_band(packed: &[u8], q: &[u8], kb: usize, g_lo: usize, g_hi: usize,
 
 /// Band-job factory for the pool (caller band + worker band).
 #[allow(clippy::too_many_arguments)]
-fn amx_band_job<'a>(
+fn vnni_band_job<'a>(
     packed: &'a [u8],
     q: &'a [u8],
     kb: usize,
@@ -276,12 +288,12 @@ fn amx_band_job<'a>(
     g_hi: usize,
     is_caller: bool,
 ) -> impl FnMut() + 'a {
-    move || unsafe { amx_band(packed, q, kb, g_lo, g_hi, out, is_caller) }
+    move || unsafe { vnni_band(packed, q, kb, g_lo, g_hi, out, is_caller) }
 }
 
 /// Packed matvec entry: `packed` from repack_*, x = f32 activation (n_in),
 /// out (n_out). Dispatched on the worker pool with a balanced band split.
-pub fn matvec_amx(
+pub fn matvec_vnni(
     packed: &[u8],
     n_in: usize,
     n_out: usize,
@@ -306,12 +318,12 @@ pub fn matvec_amx(
     let n_threads = n_threads.max(1);
     if n_threads <= 1 || ng < 2 {
         let ptr = out.as_mut_ptr();
-        unsafe { amx_band(packed, &q, kb, 0, ng, ptr, true) };
+        unsafe { vnni_band(packed, &q, kb, 0, ng, ptr, true) };
     } else {
         let g_mid = (ng / 2).clamp(1, ng - 1);
         let ptr = out.as_mut_ptr();
-        let caller = amx_band_job(packed, &q, kb, ptr, 0, g_mid, true);
-        let worker = amx_band_job(packed, &q, kb, ptr, g_mid, ng, false);
+        let caller = vnni_band_job(packed, &q, kb, ptr, 0, g_mid, true);
+        let worker = vnni_band_job(packed, &q, kb, ptr, g_mid, ng, false);
         pool::par_chunks2(caller, worker);
     }
     if prof {
@@ -322,7 +334,7 @@ pub fn matvec_amx(
 /// Band over two packed tensors (fused gate/up pair): the concatenated group
 /// space [0, ng1+ng2); groups [0, ng1) → out1, the rest → out2.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
-unsafe fn amx_band2(
+unsafe fn vnni_band2(
     p1: &[u8], ng1: usize,
     p2: &[u8],
     q: &[u8], kb: usize,
@@ -352,7 +364,7 @@ unsafe fn amx_band2(
 
 /// Fused packed pair matvec (gate/up): one Q8_0 activation, one dispatch.
 #[allow(clippy::too_many_arguments)]
-pub fn matvec2_amx(
+pub fn matvec2_vnni(
     p1: &[u8], n_out1: usize,
     p2: &[u8], n_out2: usize,
     n_in: usize,
@@ -380,15 +392,15 @@ pub fn matvec2_amx(
     if n_threads <= 1 || ng < 2 {
         let o1 = out1.as_mut_ptr();
         let o2 = out2.as_mut_ptr();
-        unsafe { amx_band2(p1, ng1, p2, &q, kb, 0, ng, o1, o2, true) };
+        unsafe { vnni_band2(p1, ng1, p2, &q, kb, 0, ng, o1, o2, true) };
     } else {
         let g_mid = (ng / 2).clamp(1, ng - 1);
         let o1 = out1.as_mut_ptr();
         let o2 = out2.as_mut_ptr();
         let q1 = &q;
         let q2 = &q;
-        let caller = move || unsafe { amx_band2(p1, ng1, p2, q1, kb, 0, g_mid, o1, o2, true) };
-        let worker = move || unsafe { amx_band2(p1, ng1, p2, q2, kb, g_mid, ng, o1, o2, false) };
+        let caller = move || unsafe { vnni_band2(p1, ng1, p2, q1, kb, 0, g_mid, o1, o2, true) };
+        let worker = move || unsafe { vnni_band2(p1, ng1, p2, q2, kb, g_mid, ng, o1, o2, false) };
         pool::par_chunks2(caller, worker);
     }
     if prof {
@@ -400,7 +412,8 @@ pub fn matvec2_amx(
 #[allow(unused)]
 fn _ty_hack(t: GgmlType) {}
 
-/// A repacked weight tensor (the engine's analog of llama.cpp's AMX buffer).
+/// A repacked weight tensor (the engine's analog of the packed buffer of
+/// llama.cpp's AMX backend — VNNI layout, no tile registers involved).
 #[derive(Clone)]
 pub struct PackedTensor {
     pub data: Vec<u8>,
@@ -416,7 +429,7 @@ pub fn repack_tensor(
     n_in: usize,
     n_out: usize,
 ) -> Option<PackedTensor> {
-    if !amx_path_available() {
+    if !vnni_path_available() {
         return None;
     }
     if n_in % TILE_K != 0 || n_out % TILE_N != 0 {

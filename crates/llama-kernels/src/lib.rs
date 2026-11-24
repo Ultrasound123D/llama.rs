@@ -24,7 +24,11 @@ pub mod pool;
 pub mod quant;
 pub mod scalar;
 pub mod kstats;
-pub mod amx;
+/// AVX-512 VNNI INT8 packed backend (Phase 6.3). NOTE: despite its llama.cpp
+/// lineage ("the AMX backend's M=1 decode route"), this module executes
+/// AVX-512 VNNI instructions only — no AMX tile instructions. See the module
+/// docs for the naming correction note.
+pub mod vnni;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;

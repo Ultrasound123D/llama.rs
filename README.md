@@ -60,7 +60,7 @@ Synthetic unit tests (hand-built GGUF + hand-computed quantization blocks) run i
 
 ## v0 limits (full honesty)
 
-- **Throughput vs llama.cpp on this VM** (2 vCPU Xeon, AVX-512+AMX): LFM3-1.7B 8.7 vs 11.9 tok/s (~74%) — the remaining gap is per-matvec scheduling/interleaving, not kernel rate (our Q4_K kernel streams 13.9–16.8 GB/s from DRAM). Qwen2.5-0.5B 8.8 vs 31.6 tok/s — llama.cpp's simple-quant tensors (Q8_0 head, Q5_0 attn) run on **AMX tile kernels** in its sapphirerapids backend; matching that needs an AMX port (future work beyond the AVX2 phase).
+- **Throughput vs llama.cpp on this VM** (matched 2-thread benchmark, prefill/decode measured separately, medians): LFM3-1.7B decode 8.5 vs 11.8 tok/s (72%); Qwen2.5-0.5B decode 23.6 vs 29.7 tok/s (80%). Prefill: 8.8 / 24.8 vs 99.8 / 159.8 tok/s — llama.rs prefills token-by-token while llama.cpp batches the whole prompt (M>1, where its real AMX tile kernels run); batched prefill is the largest remaining gap. Decode kernels stream 10–28 GB/s from DRAM. llama.cpp's simple-quant decode tensors run on its **repacked-VNNI M=1 route** (ported here as `llama-kernels/src/vnni.rs` — AVX-512 VNNI; no AMX tile instructions are executed by this engine).
 - An AVX-512 VNNI q4_K kernel exists (`llama-kernels/src/avx512.rs`, `examples/q4cmp.rs`) but measured ~9% slower than AVX2 on this VM (frequency licensing) — kept off the default dispatch.
 - No HTTP server/batching/GPU yet (Phase 7); two supported architectures (Phase 8 expands this).
 - Chat template subset (no full jinja).

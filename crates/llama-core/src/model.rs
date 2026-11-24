@@ -3,15 +3,30 @@
 use llama_gguf::{GgufFile, Value};
 use crate::prof;
 
-/// Packed (AMX/VNNI) weights keyed by tensor name — built at load time.
-pub type PackedMap = std::collections::HashMap<String, llama_kernels::amx::PackedTensor>;
+/// Packed AVX-512 VNNI weights (Q8_0/Q5_0) keyed by tensor name — built at
+/// load time. NOTE: this is the repacked-VNNI decode path (no AMX tile
+/// instructions are executed); see llama-kernels/src/vnni.rs.
+pub type PackedMap = std::collections::HashMap<String, llama_kernels::vnni::PackedTensor>;
+
+/// A/B kill switch for the packed VNNI path (same-binary comparisons):
+/// `LLAMA_RS_VNNI=0` disables load-time repacking entirely so every tensor
+/// falls back to the AVX2/VNNI vec-dot path. (The report previously claimed
+/// an `LLAMA_RS_AMX` gate that did not exist in the code; this is the real,
+/// tested switch.)
+fn vnni_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| match std::env::var("LLAMA_RS_VNNI") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
 
 /// Repack eligible tensors at load time (Phase 6.3): Q8_0 and Q5_0 with
 /// n_in % 32 == 0 and n_out % 16 == 0. token_embd is excluded (it is read
 /// by column for the embedding lookup, not matvec).
 fn build_packed(gguf: &GgufFile) -> PackedMap {
     let mut m = PackedMap::new();
-    if !llama_kernels::amx::amx_path_available() {
+    if !llama_kernels::vnni::vnni_path_available() || !vnni_enabled() {
         return m;
     }
     for t in &gguf.tensors {
@@ -23,14 +38,14 @@ fn build_packed(gguf: &GgufFile) -> PackedMap {
         }
         let (n_in, n_out) = (t.dims[0] as usize, t.dims[1] as usize);
         let data = gguf.tensor_bytes(t);
-        if let Some(p) = llama_kernels::amx::repack_tensor(t.ty, data, n_in, n_out) {
+        if let Some(p) = llama_kernels::vnni::repack_tensor(t.ty, data, n_in, n_out) {
             m.insert(t.name.clone(), p);
         }
     }
     m
 }
 
-/// Matvec dispatch: packed AMX path when available, AVX2 otherwise.
+/// Matvec dispatch: packed VNNI path (AVX-512 VNNI) when available, AVX2 otherwise.
 /// (free fn so call sites can pass &self.gguf + &mut self.s_* disjointly)
 fn pmv(
     gguf: &GgufFile,
@@ -41,13 +56,13 @@ fn pmv(
     n_threads: usize,
 ) {
     if let Some(p) = packed.get(name) {
-        llama_kernels::amx::matvec_amx(&p.data, p.n_in, p.n_out, x, n_threads, out);
+        llama_kernels::vnni::matvec_vnni(&p.data, p.n_in, p.n_out, x, n_threads, out);
     } else {
         crate::W::get(gguf, name).matvec(x, out, n_threads);
     }
 }
 
-/// Fused pair dispatch (gate/up): packed AMX pair or the AVX2 matvec2.
+/// Fused pair dispatch (gate/up): packed VNNI pair or the AVX2 matvec2.
 #[allow(clippy::too_many_arguments)]
 fn pmv2(
     gguf: &GgufFile,
@@ -60,7 +75,7 @@ fn pmv2(
     n_threads: usize,
 ) {
     if let (Some(p1), Some(p2)) = (packed.get(name1), packed.get(name2)) {
-        llama_kernels::amx::matvec2_amx(&p1.data, p1.n_out, &p2.data, p2.n_out, p1.n_in, x, n_threads, out1, out2);
+        llama_kernels::vnni::matvec2_vnni(&p1.data, p1.n_out, &p2.data, p2.n_out, p1.n_in, x, n_threads, out1, out2);
     } else {
         let w1 = crate::W::get(gguf, name1);
         let w2 = crate::W::get(gguf, name2);
@@ -108,7 +123,7 @@ pub struct Lfm3 {
     pub n_ctx: usize,
     pub pos: usize,
     pub n_threads: usize,
-    /// Phase 6.3: repacked AMX/VNNI weights (Q8_0/Q5_0) by tensor name
+    /// Phase 6.3: repacked VNNI weights (Q8_0/Q5_0) by tensor name
     packed: PackedMap,
     // scratch buffers
     s_out: Vec<f32>,
@@ -259,7 +274,7 @@ impl Lfm3 {
             let up_name = format!("blk.{il}.ffn_up.weight");
             let down = W::get(&self.gguf, &format!("blk.{il}.ffn_down.weight"));
             // Phase 6.2/6.3: fused gate+up — one activation quantization and
-            // one pool dispatch (packed AMX pair when available)
+            // one pool dispatch (packed VNNI pair when available)
             let tm0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             pmv2(&self.gguf, &self.packed, &gate_name, &up_name, &h2, &mut self.s_gate, &mut self.s_up, self.n_threads);
             if prof::prof_enabled() {
@@ -495,7 +510,7 @@ pub struct LlamaFamily {
     kv_k: Vec<Vec<f32>>,
     kv_v: Vec<Vec<f32>>,
     kv_len: Vec<usize>,
-    /// Phase 6.3: repacked AMX/VNNI weights (Q8_0/Q5_0) by tensor name
+    /// Phase 6.3: repacked VNNI weights (Q8_0/Q5_0) by tensor name
     packed: PackedMap,
     s_q: Vec<f32>, s_k: Vec<f32>, s_v: Vec<f32>, s_attn: Vec<f32>,
     s_gate: Vec<f32>, s_up: Vec<f32>, s_ffn: Vec<f32>, s_scores: Vec<f32>,
@@ -639,7 +654,7 @@ impl LlamaFamily {
 
             // FFN
             let h2 = rmsnorm(&x, &self.w_ffn_norm[il], self.eps);
-            // Phase 6.2/6.3: fused gate+up dispatch — packed AMX pair when
+            // Phase 6.2/6.3: fused gate+up dispatch — packed VNNI pair when
             // available, AVX2 matvec2 otherwise
             let gate_name = format!("blk.{il}.ffn_gate.weight");
             let up_name = format!("blk.{il}.ffn_up.weight");
