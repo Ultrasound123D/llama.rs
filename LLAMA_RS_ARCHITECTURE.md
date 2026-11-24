@@ -102,7 +102,8 @@ llama.rs/
 3. **tokenizer-ids**: the same list of texts through the llama.cpp server `/tokenize` and through `llama-rs-cli tokenize` → compare id sequences (must match 100%).
 4. **greedy-generation**: `llama-completion -m model -p prompt -n N` (no random sampling) vs `llama-rs-cli generate` → compare text/ids. A greedy match implies a match of: embedding + all ops + KV + sampler argmax.
 5. **Dequantization**: `ref_q5.c`/`ref_q6.c` (transcribed from ggml-quants.c itself) compare dequantized values from a real file column by column.
-6. **bifurcation search** on any divergence: print the first-token logits and compare (future tool).
+6. **C-golden VNNI differential (rev 3)**: `tests/parity/ref_dot.c` + `crates/llama-kernels/examples/vnni_golden.rs` — llama.cpp's own quantizers (ref + runtime contracts) and generic vec_dots re-implemented in C as the golden; 72 cases (random ×3 seeds ×8 shapes + extremes + qh-walk) × 8 paths (scalar/AVX2/VNNI256/engine/packed 1t/2t/fused); quantizer gate is BYTE-exact vs the runtime contract, path gates at 1e-7 of term energy; mutation sensitivity self-test (one flipped code byte = 7276× the noise floor); CPU dispatch gates (cpuid vs /proc/cpuinfo cross-check, `repack_tensor_gated(false)` → fallback) and end-to-end `LLAMA_RS_VNNI=0/1` top-1 identity.
+7. **bifurcation search** on any divergence: print the first-token logits and compare (future tool).
 
 ## 6) v0 Limits (not yet ported — with full honesty)
 
