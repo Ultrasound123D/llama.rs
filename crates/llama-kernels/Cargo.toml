@@ -1,0 +1,10 @@
+[package]
+name = "llama-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase 6 SIMD compute kernels: activation quantizers, int-domain vec_dot and matvec (port of ggml-cpu b12502)"
+
+[dependencies]
+llama-gguf = { path = "../llama-gguf" }
+llama-quant = { path = "../llama-quant" }

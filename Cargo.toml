@@ -3,12 +3,13 @@ resolver = "2"
 members = [
     "crates/llama-gguf",
     "crates/llama-quant",
+    "crates/llama-kernels",
     "crates/llama-core",
     "apps/llama-rs-cli",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 

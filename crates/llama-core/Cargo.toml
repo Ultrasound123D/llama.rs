@@ -8,4 +8,5 @@ description = "Core inference engine: model architectures (LFM3 hybrid, llama/qw
 [dependencies]
 llama-gguf = { path = "../llama-gguf" }
 llama-quant = { path = "../llama-quant" }
+llama-kernels = { path = "../llama-kernels" }
 unicode-general-category = "0.6"

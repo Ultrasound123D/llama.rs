@@ -4,27 +4,36 @@ version = 4
 
 [[package]]
 name = "llama-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-gguf",
+ "llama-kernels",
  "llama-quant",
  "unicode-general-category",
 ]
 
 [[package]]
 name = "llama-gguf"
-version = "0.1.0"
+version = "0.2.0"
+
+[[package]]
+name = "llama-kernels"
+version = "0.2.0"
+dependencies = [
+ "llama-gguf",
+ "llama-quant",
+]
 
 [[package]]
 name = "llama-quant"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-gguf",
 ]
 
 [[package]]
 name = "llama-rs-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "llama-core",
  "llama-gguf",

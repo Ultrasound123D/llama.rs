@@ -2,7 +2,7 @@
 
 A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage**, output-compatible with llama.cpp — proven by automated parity tests (16/16 passing).
 
-## Status (v0.1 — Phases 0–5 complete)
+## Status (v0.2 — Phases 0–6 complete)
 
 | Feature | Status | Evidence |
 |---|---|---|
@@ -14,7 +14,7 @@ A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage*
 | LFM3 chat template (thinking tags extracted from the raw template) + ChatML | ✅ | chat mode works on both models |
 | Sampling: greedy/temp/top-k/top-p | ✅ | — |
 | CLI: generate/chat/tokenize/bench/debug | ✅ | — |
-| SIMD kernels matching ggml accumulation order | ⏳ Phase 6 | ~0.9–3 tok/s (plain f32 kernels) vs ~11 for llama.cpp |
+| **Phase 6 SIMD kernels** (int8-domain AVX2+VNNI vec_dots, activation quantizers, persistent worker pool) | ✅ | LFM3-1.7B: **0.9 → 8.7 tok/s (~10×)** on this 2-vCPU VM (llama.cpp AVX-512 build: 11.9); parity 16/16 still green |
 
 ## Build & run
 
@@ -47,21 +47,24 @@ bash tests/parity/run_parity.sh
 ## Layout
 
 ```
-crates/llama-gguf    GGUF v3 reader (full-type metadata + tensor table + data) + synthetic tests
-crates/llama-quant   ggml block structures + dequantization + matvec (threads) + synthetic tests
-crates/llama-core    ops (rmsnorm/rope/swiglu/attention) + models (LFM3 hybrid + llama/qwen2 family) + tokenizer + sampler + chat
-apps/llama-rs-cli    CLI
-tests/parity/        automated parity tests vs llama.cpp + C ground-truth references (ref_q5/ref_q6)
+crates/llama-gguf     GGUF v3 reader (full-type metadata + tensor table + data) + synthetic tests
+crates/llama-quant    ggml block structures + dequantization + f16 codec + synthetic tests
+crates/llama-kernels  Phase 6: activation quantizers (q8_0/q8_K), int-domain SIMD vec_dots (AVX2+VNNI,
+                     AVX-512 experiment), persistent worker pool, parallel matvec + kernel tests
+crates/llama-core     ops (rmsnorm/rope/swiglu/attention) + models (LFM3 hybrid + llama/qwen2 family) + tokenizer + sampler + chat
+apps/llama-rs-cli     CLI
+tests/parity/         automated parity tests vs llama.cpp + C ground-truth references (ref_q5/ref_q6)
 ```
 
 Synthetic unit tests (hand-built GGUF + hand-computed quantization blocks) run in CI without models; the full parity tests run locally by direct comparison against llama.cpp binaries.
 
 ## v0 limits (full honesty)
 
-- Plain scalar f32 kernels: several times slower than llama.cpp CPU kernels (0.9 tok/s vs 11 on LFM3 here) — Phase 6: fused dot kernels in the exact ggml accumulation order (int8 for K-quants) to reach literal greedy parity and a large speedup.
-- Greedy divergence after a few tokens on near-tied candidates (logprob gaps < 0.1) is caused by f32 accumulation order — solved by the Phase 6 kernels.
+- **Throughput vs llama.cpp on this VM** (2 vCPU Xeon, AVX-512+AMX): LFM3-1.7B 8.7 vs 11.9 tok/s (~74%) — the remaining gap is per-matvec scheduling/interleaving, not kernel rate (our Q4_K kernel streams 13.9–16.8 GB/s from DRAM). Qwen2.5-0.5B 8.8 vs 31.6 tok/s — llama.cpp's simple-quant tensors (Q8_0 head, Q5_0 attn) run on **AMX tile kernels** in its sapphirerapids backend; matching that needs an AMX port (future work beyond the AVX2 phase).
+- An AVX-512 VNNI q4_K kernel exists (`llama-kernels/src/avx512.rs`, `examples/q4cmp.rs`) but measured ~9% slower than AVX2 on this VM (frequency licensing) — kept off the default dispatch.
 - No HTTP server/batching/GPU yet (Phase 7); two supported architectures (Phase 8 expands this).
 - Chat template subset (no full jinja).
+- Prefill is token-at-a-time (no batched prompt processing — Phase 7).
 
 ## License & attribution
 

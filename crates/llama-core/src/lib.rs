@@ -6,6 +6,16 @@ pub mod chat;
 
 use llama_gguf::{GgmlType, GgufFile, TensorInfo};
 
+/// Coarse profiling counters (enabled with LLAMA_RS_PROF=1): total matvec
+/// time vs everything else in the forward pass.
+pub static MATVEC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MATVEC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn prof_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| std::env::var("LLAMA_RS_PROF").is_ok())
+}
+
 /// Weight-tensor reference [n_in, n_out] in ggml order (output column = n_in consecutive values)
 pub struct W<'a> {
     pub ty: GgmlType,
@@ -28,10 +38,20 @@ impl<'a> W<'a> {
         }
     }
     /// Parallel matvec: out[o] = Σ_i x[i]·W[i,o]
+    /// Phase 6: int-domain SIMD kernels (activation quantized once into
+    /// Q8_0/Q8_K, per-column vec_dot) — the ggml-cpu contract.
     pub fn matvec(&self, x: &[f32], out: &mut [f32], n_threads: usize) {
         debug_assert_eq!(x.len(), self.n_in);
         debug_assert_eq!(out.len(), self.n_out);
-        llama_quant::matvec(self.ty, self.data, self.n_in, self.n_out, x, n_threads, out);
+        let t0 = std::time::Instant::now();
+        llama_kernels::matvec(self.ty, self.data, self.n_in, self.n_out, x, n_threads, out);
+        if prof_enabled() {
+            MATVEC_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            MATVEC_BYTES.fetch_add(
+                self.data.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
     /// One column (useful for the embedding lookup: column token_id)
     pub fn column(&self, col: usize, n: usize) -> Vec<f32> {

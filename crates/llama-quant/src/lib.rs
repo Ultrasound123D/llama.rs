@@ -9,8 +9,17 @@ use llama_gguf::GgmlType;
 /// IEEE 754 half → f32 (same behavior as GGML_FP16_TO_FP32)
 #[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
+    // Fast path: normal halves (the overwhelmingly common case for block
+    // scales) — direct bit recomposition, identical result to the full path.
+    let e = ((bits >> 10) & 0x1F) as u32;
+    if e != 0 && e != 0x1F {
+        let f32_bits = (((bits & 0x8000) as u32) << 16)
+            | ((e + 112) << 23)
+            | (((bits & 0x03FF) as u32) << 13);
+        return f32::from_bits(f32_bits);
+    }
     let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as i32;
+    let exp = (bits >> 10) & 0x1F;
     let mant = (bits & 0x03FF) as u32;
     let out = if exp == 0 {
         if mant == 0 {
@@ -160,6 +169,8 @@ pub fn dequant_block(ty: GgmlType, b: &[u8], out: &mut [f32]) {
         }
         GgmlType::Q5_K => {
             // block(176): d, dmin, scales[12], qh[32], qs[128]
+            // (dequantize_row_q5_K:1741 — qh[l] is FIXED for l in 0..32 while
+            // the bit masks u1/u2 rotate by 2 bits per 64-value group)
             let d = read_f16(b);
             let dmin = read_f16(&b[2..]);
             let scales = &b[4..16];
@@ -177,11 +188,11 @@ pub fn dequant_block(ty: GgmlType, b: &[u8], out: &mut [f32]) {
                 let m2 = dmin * m;
                 let ql = &qs[g * 32..g * 32 + 32];
                 for l in 0..32 {
-                    let hi = if qh[g * 32 + l] & u1 != 0 { 16 } else { 0 };
+                    let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
                     out[g * 64 + l] = d1 * ((ql[l] & 0xF) as f32 + hi as f32) - m1;
                 }
                 for l in 0..32 {
-                    let hi = if qh[g * 32 + l] & u2 != 0 { 16 } else { 0 };
+                    let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
                     out[g * 64 + 32 + l] = d2 * ((ql[l] >> 4) as f32 + hi as f32) - m2;
                 }
                 is += 2;

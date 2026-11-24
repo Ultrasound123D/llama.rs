@@ -72,7 +72,7 @@ fn main() {
             println!("{text}");
         }
         "chat" => {
-            let mut msgs = vec![ChatMsg { role: "user".into(), content: prompt.clone() }];
+            let msgs = vec![ChatMsg { role: "user".into(), content: prompt.clone() }];
             let formatted = match &model {
                 Model::Lfm3(_) => format_lfm3(&msgs, thinking, true),
                 Model::Llama(_) => format_chatml(&msgs, true),
@@ -109,6 +109,19 @@ fn main() {
             let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
             let (n_tok, secs) = bench(&mut model, &tokenizer, &ids, n_gen);
             println!("bench: {n_tok} tokens in {secs:.2}s = {:.2} tok/s", n_tok as f32 / secs);
+            if llama_core::prof_enabled() {
+                let secs: f64 = secs as f64;
+                let fwds = (ids.len() + n_tok) as f64; // prefill + generated forwards
+                let mv_ns = llama_core::MATVEC_NS.load(std::sync::atomic::Ordering::Relaxed) as f64;
+                println!(
+                    "prof: matvec {mv_ms:.1} ms/token of {ms:.1} ms/token total ({pct:.0}%), weights {gb:.2} GB/token streamed at {gbs:.1} GB/s",
+                    mv_ms = mv_ns / 1e6 / fwds,
+                    ms = secs * 1000.0 / n_tok as f64,
+                    pct = 100.0 * (mv_ns / 1e6 / fwds) / (secs * 1000.0 / n_tok as f64),
+                    gb = llama_core::MATVEC_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9 / fwds,
+                    gbs = llama_core::MATVEC_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9 / (secs * n_tok as f64),
+                );
+            }
         }
         _ => { eprintln!("unknown mode {mode}"); std::process::exit(1); }
     }
