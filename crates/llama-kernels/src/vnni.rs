@@ -432,6 +432,25 @@ pub fn repack_tensor(
     if !vnni_path_available() {
         return None;
     }
+    repack_tensor_gated(ty, data, n_in, n_out, true)
+}
+
+/// Dispatch-gate-exposed variant: `cpu_ok == false` simulates a machine
+/// without AVX512-VNNI (or the LLAMA_RS_VNNI=0 kill switch) and must return
+/// None for EVERY type/shape — the caller then takes the AVX2/scalar fallback
+/// and no AVX-512 instruction is ever reached. Separated from
+/// `repack_tensor` so the dispatch *decision* is unit-testable without
+/// physically removing CPU features.
+pub fn repack_tensor_gated(
+    ty: GgmlType,
+    data: &[u8],
+    n_in: usize,
+    n_out: usize,
+    cpu_ok: bool,
+) -> Option<PackedTensor> {
+    if !cpu_ok {
+        return None;
+    }
     if n_in % TILE_K != 0 || n_out % TILE_N != 0 {
         return None;
     }

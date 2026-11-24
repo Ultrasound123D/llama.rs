@@ -1,9 +1,22 @@
-# llama.rs — Phase 6.1–6.3 Performance Engineering Report (rev 2)
+# llama.rs — Phase 6.1–6.3 Performance Engineering Report (rev 3)
 
-**Scope:** profiling infrastructure, scheduling experiments, **AVX-512 VNNI INT8 packed backend** (renamed from "AMX INT8 backend" — see the revision note below).
+**Scope:** profiling infrastructure, scheduling experiments, **AVX-512 VNNI INT8 packed backend** (renamed from "AMX INT8 backend" — see the rev-2 note), and — **rev 3 — the independent verification campaign** of the VNNI path (C-golden differential harness, dispatch safety, matched prefill/decode benchmark) requested in review.
 **Machine:** 2 vCPU Xeon (Sapphire Rapids class) @ 3.2 GHz KVM guest, AVX-512 + AVX512-VNNI + AMX INT8/BF16 (OS-enabled, XCR0 bits 17/18 verified), 504 MB L3, DRAM ceiling ≈ 14–16 GB/s sustained at 2 threads for one linear stream.
 **Baseline at phase start (rev-1 measurements):** LFM3-1.7B 8.5–8.9 tok/s · Qwen2.5-0.5B 9.2–9.5 tok/s (llama.cpp b12502 references: 10.7–12.0 and 29.4–30.0 decode).
 **No HTTP/server work was done — inference performance only, per the phase contract.**
+
+---
+
+## Revision note (rev 3, 2026-11-25) — the verification campaign
+
+Review verdict was: verify correctness of the VNNI path first, then focus on the remaining gap. Executed in order:
+
+1. **Independent C golden reference built from llama.cpp's own code** (`tests/parity/ref_dot.c`): transcribes `quantize_row_q8_0_ref` + the runtime x86 quantizer (`arch/x86/quants.c:302`) + `ggml_vec_dot_q8_0_q8_0_generic` + `ggml_vec_dot_q5_0_q8_0_generic`. It emits *both* llama.cpp quantizer contracts — the discovery here: **llama.cpp itself has two Q8_0 activation-quantizer contracts** (ref: `id = 1/d`, `roundf` vs runtime: `id = 127/max`, round-to-nearest-even) — and the runtime one is what inference actually executes, so that is the byte-exact gate for llama.rs. Details in §3.4.
+2. **Differential sweep:** 72 cases (random ×3 seeds ×8 shapes + extremes + qh-walk) × 8 paths (scalar / AVX2 / AVX2+VNNI256 / engine dispatch / packed 1-thread / packed 2-thread / fused pair) — worst error **1.4e-7 of term energy**; activation quantizer **byte-exact** vs the C runtime contract (0 mismatches over all cases). The one initially-"failing" mode (extremes) was root-caused to exact catastrophic cancellation — outputs are pure f32-rounding residues — and the metric was fixed to term-energy normalization (documented in §3.4; all integer dots independently confirmed exact in Python).
+3. **Mutation sensitivity self-test:** one flipped weight-code byte → error 5.68e-4 of term energy = **7276× the clean noise floor** — the gates provably detect real corruption (not vacuously green).
+4. **CPU feature dispatch verified:** Rust `cpuid` detection cross-checked against `/proc/cpuinfo` (avx512_vnni, amx_int8: MATCH); `repack_tensor_gated(cpu_ok=false)` returns `None` for every type/shape combination (the machine-without-AVX512 simulation → AVX2 fallback, no panic, no AVX-512 instruction reached); end-to-end `LLAMA_RS_VNNI=0` vs `=1` on the real Qwen model: **top-1 token and top-5 ranking identical** (logit deltas ~0.25% — f32 accumulation-order differences compounding through 24 layers, benign).
+5. **Matched benchmark re-run with exact-matched prompt lengths** (llama-bench `-p 55/54` per model tokenizer, our natural prompt tokenizes to exactly 55/54): decode LFM3 **81%**, Qwen **74%**; prefill 10%/15% (llama.cpp batches, we are token-by-token — algorithmic, not kernel). Fresh A/B: the packed path alone lifts Qwen decode **12.90 → 23.38 tok/s (+81%)**.
+6. **All tests re-run fresh at this state:** 28 workspace tests green, parity **16/16** vs llama.cpp, golden sweep all gates green.
 
 ---
 
@@ -85,43 +98,62 @@ For **decode (M == 1)** llama.cpp's AMX backend **repacks weights at load time**
 
 The packed VNNI path is the default for Q8_0/Q5_0 tensors because the same-binary A/B demonstrates the improvement (§4) and parity remains 16/16; `LLAMA_RS_VNNI=0` disables it for reproduction, `LLAMA_RS_SLOT=0` A/Bs the dispatch path.
 
+### 3.4 Independent C-golden differential harness (rev 3 verification)
+
+**Artifacts:** `tests/parity/ref_dot.c` (golden reference, gcc -O2) + `crates/llama-kernels/examples/vnni_golden.rs` (driver; compiles the C reference itself if missing).
+
+**Why a C golden at all:** the rev-2 intra-engine differential (VNNI vs our AVX2 kernels) shares the activation quantizer and the block layouts on both sides — a common-mode hole: a bug in the shared quantizer or layout passes both. The C reference is transcribed from llama.cpp's own sources in a different language and re-compiled, closing that hole: quantizer, layout and dot contracts are all independently re-implemented.
+
+**The two-quantizer discovery:** llama.cpp's `quantize_row_q8_0_ref` (file-creation contract) computes `id = 1/d` with `roundf` (half-away-from-zero); the quantizer it actually **executes** on AVX2 x86 (`arch/x86/quants.c:302`) computes `id = 127.f/maxScalar` with hardware round-to-nearest-even. These are subtly different contracts inside llama.cpp itself. Our engine implements the runtime one — and the harness gates our quantizer **byte-exact against the C transcription of the runtime contract** (0 mismatches across all 72 cases; `d` bits, codes, tie-rounding all identical).
+
+**Coverage (72 cases × 8 paths):** shapes from the legal minimum (32×16) through model-realistic (896×304, 2048×4096); random data (3 seeds × 8 shapes × Q8_0/Q5_0) + `extremes` (f16 scales 0 / min-normal / 1 / 65504 × code bytes 00/01/7F/80/FE/FF, activations quantizing to ±127) + `qhwalk` (each of the 32 `qh` bit positions exercised). Paths compared per case: scalar kernels, direct AVX2 calls, AVX2+VNNI256 (the engine's actual dispatch on this CPU), full engine `matvec`, packed VNNI 1-thread, packed VNNI 2-thread, fused `matvec2_vnni`.
+
+**Error metric — term-energy normalization (methodology finding):** per-output relative error is the wrong metric for dot products whose outputs cross zero; on adversarial data the outputs cancel *exactly* (e.g. block terms 129032508 − 127032004 − 2000504 = 0) and every output becomes a pure f32-rounding residue — no two accumulation orders can agree "relatively" on those. Root-caused (not patched around): the integer dots were confirmed exact independently (Python re-implementation over the raw bytes); the golden emits per-column term energy Σ|sumi_b·d_b| and the gate is `max|a−b| / max(term energy)`. The packed path then shows ≤1.1e-7 and all SIMD paths ≤1.4e-7 — i.e. **f32-rounding-level agreement with llama.cpp's own generic kernels, even under total cancellation.**
+
+**Mutation sensitivity:** the harness proves its own gates are not vacuous — flipping ONE weight-code byte in one block moves the error from 7.8e-8 (clean noise floor) to 5.68e-4 of term energy (**7276×**), far above every gate.
+
+**Known shared-saturation corner (documented, faithful to llama.cpp):** the AVX2-only (non-VNNI) fallback kernel's `maddubs` pair-sums saturate at ±32767 when four 127-magnitude products collide — exactly as ggml's own AVX2-only path does (it takes `_mm256_dpbusd_epi32` when AVX512-VNNI+VL is present, which this machine and our runtime check both are). Parity with llama.cpp's fallback behavior, not a deviation.
+
 ---
 
-## 4. Results (rev 2 matched campaign, 2026-11-25)
+## 4. Results (rev 3 matched campaign, 2026-11-25)
 
-**Conditions (matched):** same CPU, `-t 2` both engines, llama.rs `--ctx 2048` (KV rows actually written ≈ 96; capacity does not enter the per-token loop), llama-bench `-p 64 -n 32 -r 5` (its ctx derives from p+n). llama.rs uses a 56-token natural prompt (token count printed by the CLI); llama-bench synthesizes its own 64-token prompt — rates are compared, token counts are reported on both sides. llama.rs medians over 9 process repetitions; all raw runs listed.
+**Conditions (matched):** same CPU, `-t 2` both engines; llama.rs `--ctx 2048` (KV rows actually written ≈ 88; capacity does not enter the per-token loop); llama-bench has no context flag (its ctx derives from p+n — b12502 has no `-c`); **prompt lengths now exactly matched** — our natural prompt tokenizes to 55 (LFM3) / 54 (Qwen) tokens per the model tokenizer and llama-bench is invoked with `-p 55` / `-p 54` respectively, `-n 32` both. llama.rs medians over 5 process repetitions (all raw runs listed by the script); llama-bench 5 internal reps. llama.cpp reference numbers move within the guest's 5–8% variance band across sessions (tg: 10.65 this campaign vs 11.82 in rev 2 — both quoted honestly).
 
 | Model | Phase | llama.rs (VNNI on) | llama.cpp b12502 | ratio |
 |---|---|---|---|---|
-| LFM3-1.7B Q4_K_M | **prefill (pp)** | 8.77 tok/s (8.64–9.54) | 99.82 tok/s | **9 %** |
-| LFM3-1.7B Q4_K_M | **decode (tg)** | 8.50 tok/s (8.29–9.22) | 11.82 tok/s | **72 %** |
-| Qwen2.5-0.5B Q4_K_M | **prefill (pp)** | 24.75 tok/s (23.82–26.07) | 159.82 tok/s | **15 %** |
-| Qwen2.5-0.5B Q4_K_M | **decode (tg)** | 23.62 tok/s (22.30–25.37) | 29.68 tok/s | **80 %** |
+| LFM3-1.7B Q4_K_M | **prefill (pp)** | 8.66 tok/s (5 runs: 8.30–9.10) | 84.16 tok/s | **10 %** |
+| LFM3-1.7B Q4_K_M | **decode (tg)** | 8.62 tok/s (5 runs: 8.43–8.82) | 10.65 tok/s | **81 %** |
+| Qwen2.5-0.5B Q4_K_M | **prefill (pp)** | 24.45 tok/s (5 runs: 23.57–24.96) | 157.95 tok/s | **15 %** |
+| Qwen2.5-0.5B Q4_K_M | **decode (tg)** | 23.77 tok/s (5 runs: 23.17–24.37) | 31.98 tok/s | **74 %** |
 
-**Same-binary A/B of the packed VNNI path** (`LLAMA_RS_VNNI=0`, 5 reps, medians):
+**Same-binary A/B of the packed VNNI path** (`LLAMA_RS_VNNI=0`, 5 reps, medians, rev-3 fresh run):
 
 | Model | tg (packed VNNI on) | tg (off → AVX2 path) | effect | pp (on/off) |
 |---|---|---|---|---|
-| Qwen2.5-0.5B | 23.62 | 14.11 | **+67 %** from the packed path alone | 24.75 / 14.34 (+73 %) |
-| LFM3-1.7B | 8.50 | 8.40 | +1.2 % (within guest noise — expected: LFM3 has no Q8_0/Q5_0 decode tensors) | 8.77 / 8.44 |
+| Qwen2.5-0.5B | 23.38 | 12.90 | **+81 %** from the packed path alone | 23.54 / 13.10 |
+| LFM3-1.7B | 7.93 | 7.89 | within guest noise — expected: LFM3 has no Q8_0/Q5_0 decode tensors (its weights are Q4_K/Q6_K: the K-quant repack is the next measured lever) | — |
+
+**End-to-end accuracy A/B (`--mode debug`, real Qwen model):** `LLAMA_RS_VNNI=1` vs `=0` → top-1 token identical (` Paris`), top-5 ranking identical; logit deltas ~0.25% (f32 accumulation-order compounding through 24 layers). Parity suite 16/16 holds with the packed path on.
 
 **Kernel-level (isolated `kprofile`, median of 15 reps, 2 threads — this benches the AVX2 `matvec` path; the packed path is evidenced by the A/B above):** Q4_K 2048×7680: 18.70 GB/s; Q6_K 7680×2048: 24.98; Q6_K head 2048×32768: 28.16; Q4_0/Q5_0/Q8_0 2048×7680: 10.35 / 10.64 / 13.39; Qwen head Q8_0 896×151936: 14.66; Qwen gate Q5_0 896×4864: 13.3–14.1; F16: 20.5.
 
 ### 4.1 Why llama.cpp is still ahead (measured, not guessed)
 
-- **Prefill is the largest gap (9 % / 15 %):** llama.rs processes the prompt token-by-token (one M=1 forward per token — 8.5–24.8 tok/s ≈ its decode rate); llama.cpp batches the prompt into M>1 GEMMs (ubatch 512), which is also where its **real AMX tile kernels** run. The engine has no batched-prefill path yet — this was not visible in rev 1 because prefill was never measured separately.
-- **Decode gap (72 % / 80 %):** LFM3's Q4_K/Q6_K weights still run the AVX2 kernels while llama.cpp AMX-repacks K-quants (the measured next step, out of the 6.3 type scope); Qwen's ffn_down Q4_K/Q6_K likewise; llama.cpp's graph executor fuses op boundaries — our serial glue is ~3 ms/token.
-- **Conclusion:** llama.rs is not faster than llama.cpp on any measured axis; the goal of Phase 6 was partially met (2.5× self-improvement, llama.cpp's M=1 VNNI route now ported) and the remaining gaps are now precisely quantified.
+- **Prefill is the largest gap (10 % / 15 %):** llama.rs processes the prompt token-by-token (one M=1 forward per token — 8.7–24.5 tok/s ≈ its decode rate); llama.cpp batches the prompt into M>1 GEMMs (ubatch 512), which is also where its **real AMX tile kernels** run. The engine has no batched-prefill path yet — this was not visible in rev 1 because prefill was never measured separately.
+- **Decode gap (81 % / 74 %):** LFM3's Q4_K/Q6_K weights still run the AVX2 kernels while llama.cpp AMX-repacks K-quants (the measured next step — §7); Qwen's ffn_down Q4_K/Q6_K likewise; llama.cpp's graph executor fuses op boundaries — our serial glue is ~3 ms/token; ~170 small heap allocations per decode token (activation-quantize buffers per matvec + logits copies) — scratch-buffer reuse is a measured lever.
+- **Conclusion:** llama.rs is not faster than llama.cpp on any measured axis; the decode kernels for Q8_0/Q5_0 are now **verified equivalent to llama.cpp's own reference semantics** (§3.4), which makes the remaining gap a scheduling/coverage problem (K-quants + glue), not a correctness problem.
 
 ---
 
-## 5. Validation gates (all re-run at the rev-2 final state)
+## 5. Validation gates (all re-run at the rev-3 final state)
 
-1. **Parity suite: 16/16** — tokenizer ids 10/10, top-1 greedy after prefill 4/4, C-reference dequantization 2/2 (Q5_0, Q6_K; max diff 5e-10).
-2. **Workspace tests: 28 passing across 4 integration suites** (gguf synthetic 2, kernel contracts 11, **vnni 10** — randomized + edge cases, quant 5). (Rev 1's "13/13 suites" phrasing is superseded by these counts.)
-3. **Multiple repetitions:** 9-rep benchmark campaign with medians and all runs listed; 5-rep same-binary A/B; kernel benches 15 reps; llama-bench 5 internal reps.
-4. **No regression hidden by averaging:** every change gated on the parity suite; A/B comparisons through the same binary (`LLAMA_RS_VNNI`, `LLAMA_RS_SLOT`, `LLAMA_RS_SPLIT`).
-5. Failed experiments are documented in §2.1/§2.2 rather than silently dropped.
+1. **C-golden differential sweep: ALL GATES GREEN** (rev 3, `vnni_golden` example) — 72 cases × 8 paths vs llama.cpp's transcribed kernels; quantizer byte-exact vs the runtime contract; worst path error 1.4e-7 of term energy; mutation sensitivity 7276× noise floor; dispatch gates (cpuinfo cross-check, gated repack → None).
+2. **Parity suite: 16/16** — tokenizer ids 10/10, top-1 greedy after prefill 4/4, C-reference dequantization 2/2 (Q5_0, Q6_K; max diff 5e-10).
+3. **Workspace tests: 28 passing across 4 integration suites** (gguf synthetic 2, kernel contracts 11, vnni 10 — randomized + edge cases, quant 5).
+4. **Multiple repetitions:** 5-rep benchmark campaign with medians and all runs listed; 5-rep same-binary A/B; kernel benches 15 reps; llama-bench 5 internal reps.
+5. **No regression hidden by averaging:** every change gated on the parity suite; A/B comparisons through the same binary (`LLAMA_RS_VNNI`, `LLAMA_RS_SLOT`, `LLAMA_RS_SPLIT`).
+6. Failed experiments are documented in §2.1/§2.2 rather than silently dropped.
 
 ### 5.1 Unsafe-code / atomics audit summary (the 017145d diff)
 
@@ -138,16 +170,17 @@ The packed VNNI path is the default for Q8_0/Q5_0 tensors because the same-binar
 cd llama.rs
 cargo build --release
 cargo test --release --workspace          # 28 tests incl. the 10 VNNI (randomized + edge) tests
+cargo run --release --example vnni_golden  # rev 3: 72-case C-golden differential sweep + dispatch gates + mutation self-test
 bash tests/parity/run_parity.sh          # 16/16 vs llama.cpp
-bash scripts/bench_decode.sh 9            # pp+tg matched table vs llama-bench (pp64/tg32)
+bash scripts/bench_decode.sh 5            # pp+tg matched table vs llama-bench (exact-matched prompt lengths)
 LLAMA_RS_VNNI=0 bash scripts/bench_decode.sh 5   # A/B: AVX2 fallback, same binary
 bash scripts/profile_decode.sh            # per-op tables + kernel micro-bench
 LLAMA_RS_PROF=1 ./target/release/llama-rs-cli -m <model> --mode bench -p "The capital of France is" -n 48 -t 2
 ```
 
-## 7. Next steps (ranked by measured gap)
+## 7. Next steps (ranked by measured gap — verification phase complete, optimization unlocked)
 
-1. **Batched prefill (M>1)** — the largest measured gap (pp 9 % / 15 %): process the prompt in ubatches with a GEMM-style path. This is also the prerequisite for a genuine AMX-tile backend (tiles need M>1; the CPUID/XCR0 groundwork is already in place and validated).
-2. **K-quant repack (Q4_K/Q5_K/Q6_K) to the packed VNNI format** — the measured LFM3 decode gap is largely this (llama.cpp's `pack_qs<block_q4_K>`-style layout with per-sub-block scales; mmq.cpp 1574–1980 hold the kernels).
-3. Trim the serial glue (W-handle caching, rmsnorm scratch reuse, logits buffer reuse — ~3 ms/token).
+1. **K-quant repack (Q4_K/Q5_K/Q6_K) to the packed VNNI format** — the LFM3 decode gap is largely this (llama.cpp's `pack_qs<block_q4_K>`-style layout with per-sub-block scales; mmq.cpp 1574–1980 hold the kernels); also Qwen's ffn_down. The verification harness of §3.4 extends directly (ref_dot.c gains Q4_K/Q6_K golden dots).
+2. **Batched prefill (M>1)** — the largest measured gap (pp 10 % / 15 %): process the prompt in ubatches with a GEMM-style path. This is also the prerequisite for a genuine AMX-tile backend (tiles need M>1; the CPUID/XCR0 groundwork is already in place and validated).
+3. Trim the serial glue — scratch-buffer reuse for the ~170 activation-quantize allocations per decode token + logits buffer reuse (~3 ms/token measured).
 4. Hardening: `catch_unwind` job-failure flag in the pool.

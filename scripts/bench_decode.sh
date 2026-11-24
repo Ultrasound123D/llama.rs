@@ -38,11 +38,11 @@ median_of() { # space-separated numbers -> median
     printf '%s\n' $1 | sort -n | awk '{a[NR]=$1} END {print (NR%2==1)? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'
 }
 
-bench_cpp_both() { # model -> "pp tg" (llama-bench mean over its internal reps)
+bench_cpp_both() { # model n_pp -> "pp tg" (llama-bench mean over its internal reps)
     local out pp tg
-    out=$("$LLAMA_BIN/llama-bench" -m "$1" -t "$THREADS" -p 64 -n 32 -r 5 2>/dev/null)
-    pp=$(printf '%s\n' "$out" | awk -F'|' '/pp64/ {gsub(/ /,"",$8); n=split($8,a,"±"); print a[1]}' | head -1)
-    tg=$(printf '%s\n' "$out" | awk -F'|' '/tg32/ {gsub(/ /,"",$8); n=split($8,a,"±"); print a[1]}' | head -1)
+    out=$("$LLAMA_BIN/llama-bench" -m "$1" -t "$THREADS" -p "$2" -n "$N" -r 5 2>/dev/null)
+    pp=$(printf '%s\n' "$out" | awk -F'|' -v tag="pp$2 " '$0 ~ tag {gsub(/ /,"",$8); n=split($8,a,"±"); print a[1]}' | head -1)
+    tg=$(printf '%s\n' "$out" | awk -F'|' -v tag="tg$N " '$0 ~ tag {gsub(/ /,"",$8); n=split($8,a,"±"); print a[1]}' | head -1)
     echo "${pp:-0} ${tg:-0}"
 }
 
@@ -50,10 +50,13 @@ echo "reps=$REPS n=$N threads=$THREADS ctx=$CTX (prefill and decode measured sep
 echo
 for m in "$LFM" "$QWEN"; do
     name=$(basename "$m" .gguf)
+    # exact matched prompt length: our natural prompt tokenizes to NPP tokens
+    # per model tokenizer; llama-bench synthesizes exactly the same count
+    n_pp=$("$LLAMA_RS" -m "$m" --mode tokenize --no-bos -p "$PROMPT" -t 1 2>/dev/null | grep -oE 'tokens\([0-9]+\)' | grep -oE '[0-9]+')
     series=$(bench_rs "$m")
     rs_pp=$(median_of "${series%%|*}")
     rs_tg=$(median_of "${series##*|}")
-    read -r cpp_pp cpp_tg <<< "$(bench_cpp_both "$m")"
+    read -r cpp_pp cpp_tg <<< "$(bench_cpp_both "$m" "${n_pp:-54}")"
     pp_ratio=$(python3 -c "print(f'{100*float(\"${rs_pp:-0}\")/float(\"${cpp_pp:-1}\"):.0f}')")
     tg_ratio=$(python3 -c "print(f'{100*float(\"${rs_tg:-0}\")/float(\"${cpp_tg:-1}\"):.0f}')")
     printf '%-34s pp: llama.rs %6.2f | llama.cpp %6.2f tok/s | %5s%%\n' "$name" "$rs_pp" "$cpp_pp" "$pp_ratio"
