@@ -3,38 +3,51 @@ pub mod model;
 pub mod tokenizer;
 pub mod sampler;
 pub mod chat;
+pub mod prof;
 
 use llama_gguf::{GgmlType, GgufFile, TensorInfo};
 
-/// Coarse profiling counters (enabled with LLAMA_RS_PROF=1): total matvec
-/// time vs everything else in the forward pass.
+// Legacy coarse counters (kept for CLI compat; the op-level profiler in
+// `prof` supersedes them — see `prof::report`).
 pub static MATVEC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MATVEC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn prof_enabled() -> bool {
-    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("LLAMA_RS_PROF").is_ok())
+    prof::prof_enabled()
 }
 
-/// Weight-tensor reference [n_in, n_out] in ggml order (output column = n_in consecutive values)
+/// Weight-tensor reference [n_in, n_out] in gguf order (output column = n_in consecutive values)
 pub struct W<'a> {
     pub ty: GgmlType,
     pub data: &'a [u8],
     pub n_in: usize,
     pub n_out: usize,
+    /// Profiling bucket for this tensor's class ("mv blk.*.ffn_gate.weight"),
+    /// resolved once in `get` — zero lookup cost in `matvec`.
+    pbucket: Option<&'static prof::Bucket>,
 }
 
 impl<'a> W<'a> {
     /// Fetch a tensor by name from the file (dims [n_in, n_out])
     pub fn get(gguf: &'a GgufFile, name: &str) -> W<'a> {
+        let t0 = prof::tsc();
         let t: &TensorInfo = gguf.tensor(name)
             .unwrap_or_else(|| panic!("missing tensor: {name}"));
         assert!(t.dims.len() == 2, "tensor {name} dims {:?}", t.dims);
+        let class = prof::tensor_class(name);
+        let b = prof::bucket(&format!("mv {class} {:?}", t.ty));
+        if prof::prof_enabled() {
+            // timing of the lookup itself + the name String allocation
+            // (model code passes a format!() String per weight per token)
+            prof::record(prof::bucket("tensor_lookup(W::get)"), t0, 0);
+            prof::note_alloc(prof::bucket("tensor_lookup(W::get)"), name.len());
+        }
         W {
             ty: t.ty,
             data: gguf.tensor_bytes(t),
             n_in: t.dims[0] as usize,
             n_out: t.dims[1] as usize,
+            pbucket: Some(b),
         }
     }
     /// Parallel matvec: out[o] = Σ_i x[i]·W[i,o]
@@ -43,19 +56,24 @@ impl<'a> W<'a> {
     pub fn matvec(&self, x: &[f32], out: &mut [f32], n_threads: usize) {
         debug_assert_eq!(x.len(), self.n_in);
         debug_assert_eq!(out.len(), self.n_out);
-        let t0 = std::time::Instant::now();
+        let t0 = prof::tsc();
         llama_kernels::matvec(self.ty, self.data, self.n_in, self.n_out, x, n_threads, out);
-        if prof_enabled() {
-            MATVEC_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            MATVEC_BYTES.fetch_add(
-                self.data.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        if prof::prof_enabled() {
+            let b: &'static prof::Bucket = self.pbucket.unwrap_or_else(|| {
+                // W built directly (tests): class from shape only
+                prof::bucket(&format!("matvec {:?} {}x{}", self.ty, self.n_in, self.n_out))
+            });
+            prof::record(b, t0, self.data.len() as u64);
         }
     }
     /// One column (useful for the embedding lookup: column token_id)
     pub fn column(&self, col: usize, n: usize) -> Vec<f32> {
-        llama_quant::column_f32(self.ty, self.data, col, n)
+        let t0 = prof::tsc();
+        let v = llama_quant::column_f32(self.ty, self.data, col, n);
+        if prof::prof_enabled() {
+            prof::record(prof::bucket("embed_lookup(column)"), t0, (n * 4) as u64);
+        }
+        v
     }
 }
 
@@ -70,13 +88,21 @@ pub fn weights1d(gguf: &GgufFile, name: &str) -> Vec<f32> {
 // ---------- ops (same formulas as ggml-cpu/ops.cpp) ----------
 
 /// RMSNorm: x * w / sqrt(mean(x²)+eps)  [ggml_compute_forward_rms_norm]
+/// f64 accumulation (wider than llama.cpp's f32; stays within parity gates).
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let t0 = prof::tsc();
     let n = x.len();
     let mut ss = 0f64;
     for v in x { ss += (*v as f64) * (*v as f64); }
     let mean = ss / n as f64;
     let scale = 1.0 / (mean + eps as f64).sqrt();
-    x.iter().zip(w).map(|(v, wv)| (*v as f64 * scale * (*wv as f64)) as f32).collect()
+    let out: Vec<f32> = x.iter().zip(w).map(|(v, wv)| (*v as f64 * scale * (*wv as f64)) as f32).collect();
+    if prof::prof_enabled() {
+        let b = prof::bucket("rmsnorm");
+        prof::record(b, t0, 0);
+        prof::note_alloc(b, n * 4);
+    }
+    out
 }
 
 #[inline]
@@ -98,13 +124,22 @@ pub fn softmax_inplace(x: &mut [f32]) {
 }
 
 /// SiLU-gated FFN: down( silu(gate) ⊙ up )  [build_ffn LLM_FFN_SILU/LLM_FFN_PAR]
+/// The elementwise part is timed exclusively from the down-projection matvec
+/// (which buckets under its own tensor class).
 pub fn swiglu_ffn(down: &W, gate_out: &[f32], up_out: &[f32], scratch: &mut Vec<f32>, n_threads: usize) -> Vec<f32> {
+    let t0 = prof::tsc();
     let n_ff = gate_out.len();
     scratch.resize(n_ff, 0.0);
     for i in 0..n_ff {
         scratch[i] = silu(gate_out[i]) * up_out[i];
     }
     let mut out = vec![0f32; down.n_out];
+    if prof::prof_enabled() {
+        // time ONLY the elementwise part (exclusive of the matvec below)
+        let b = prof::bucket("swiglu(elementwise)");
+        prof::record(b, t0, 0);
+        prof::note_alloc(b, down.n_out * 4);
+    }
     down.matvec(scratch, &mut out, n_threads);
     out
 }
@@ -113,6 +148,7 @@ pub fn swiglu_ffn(down: &W, gate_out: &[f32], up_out: &[f32], scratch: &mut Vec<
 /// angle_j = pos · base^(−2j/d) / ff_j, pairs (j, j+d/2)
 /// Operates on a whole vec split into heads [n_head][head_dim]
 pub fn rope_neox_inplace(heads: &mut [f32], pos: usize, base: f64, factors: Option<&[f32]>) {
+    let t0 = prof::tsc();
     let d = heads.len(); // head_dim (this operates on a single head)
     let half = d / 2;
     // theta_scale = base^(-2/d); theta_j = pos·base^(-2j/d)
@@ -127,6 +163,9 @@ pub fn rope_neox_inplace(heads: &mut [f32], pos: usize, base: f64, factors: Opti
         heads[j] = (x0 * c - x1 * s) as f32;
         heads[j + half] = (x0 * s + x1 * c) as f32;
         theta *= theta_scale;
+    }
+    if prof::prof_enabled() {
+        prof::record(prof::bucket("rope"), t0, 0);
     }
 }
 

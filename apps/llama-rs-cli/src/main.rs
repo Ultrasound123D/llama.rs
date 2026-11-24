@@ -4,6 +4,7 @@ use llama_core::model::{Lfm3, LlamaFamily};
 use llama_core::tokenizer::BpeTokenizer;
 use llama_core::sampler::{sample, SamplerCfg, SimpleRng};
 use llama_core::chat::{ChatMsg, format_lfm3, format_chatml, THINK_CLOSE, THINK_OPEN};
+use llama_core::prof;
 use llama_gguf::GgufFile;
 use std::io::Write;
 
@@ -49,6 +50,7 @@ fn main() {
     let arch = gguf.arch().unwrap_or("").to_string();
     let tokenizer = BpeTokenizer::from_gguf(&gguf);
     drop(gguf);
+    prof::init();
 
     let t0 = std::time::Instant::now();
     let mut model = match arch.as_str() {
@@ -109,18 +111,9 @@ fn main() {
             let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
             let (n_tok, secs) = bench(&mut model, &tokenizer, &ids, n_gen);
             println!("bench: {n_tok} tokens in {secs:.2}s = {:.2} tok/s", n_tok as f32 / secs);
-            if llama_core::prof_enabled() {
-                let secs: f64 = secs as f64;
-                let fwds = (ids.len() + n_tok) as f64; // prefill + generated forwards
-                let mv_ns = llama_core::MATVEC_NS.load(std::sync::atomic::Ordering::Relaxed) as f64;
-                println!(
-                    "prof: matvec {mv_ms:.1} ms/token of {ms:.1} ms/token total ({pct:.0}%), weights {gb:.2} GB/token streamed at {gbs:.1} GB/s",
-                    mv_ms = mv_ns / 1e6 / fwds,
-                    ms = secs * 1000.0 / n_tok as f64,
-                    pct = 100.0 * (mv_ns / 1e6 / fwds) / (secs * 1000.0 / n_tok as f64),
-                    gb = llama_core::MATVEC_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9 / fwds,
-                    gbs = llama_core::MATVEC_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9 / (secs * n_tok as f64),
-                );
+            if prof::prof_enabled() {
+                print_kstats_summary(n_tok);
+                print!("{}", prof::report());
             }
         }
         _ => { eprintln!("unknown mode {mode}"); std::process::exit(1); }
@@ -175,27 +168,76 @@ fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize
         logits = l.to_vec();
     }
     let t0 = std::time::Instant::now();
+    // separate prefill from decode in the profile: reset all counters now
+    prof::reset();
+    llama_kernels::kstats::reset();
+    let tsc0 = prof::decode_begin();
     let mut count = 0usize;
     for _ in 0..n {
+        let ts0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         let next = logits.iter().enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap_or(0);
+        if prof::prof_enabled() {
+            prof::record(prof::bucket("sample(argmax)"), ts0, 0);
+        }
         if next == tok.eos_id { break; }
         count += 1;
         let l = forward_token(model, next);
         logits = l.to_vec();
     }
-    (count, t0.elapsed().as_secs_f32())
+    let secs = t0.elapsed().as_secs_f32();
+    prof::decode_end(tsc0, count as u64);
+    (count, secs)
 }
 
 fn forward_token(model: &mut Model, token: u32) -> Vec<f32> {
-    match model {
-        Model::Lfm3(m) => {
-            let l = m.forward(token);
-            l.to_vec()
-        }
-        Model::Llama(m) => {
-            let l = m.forward(token);
-            l.to_vec()
-        }
+    // NOTE: the forward pass itself is timed by its internal op buckets;
+    // only the logits copy is timed here (exclusively).
+    let l = match model {
+        Model::Lfm3(m) => m.forward(token),
+        Model::Llama(m) => m.forward(token),
+    };
+    let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+    let out = l.to_vec();
+    if prof::prof_enabled() {
+        let b = prof::bucket("logits_copy(to_vec)");
+        prof::record(b, t0, 0);
+        prof::note_alloc(b, out.len() * 4);
     }
+    out
+}
+
+/// Kernel-side counters (kstats) summary — printed alongside the op report.
+fn print_kstats_summary(n_tok: usize) {
+    use llama_kernels::kstats as ks;
+    // reuse the TSC calibration from prof (ticks→ns)
+    let ghz = prof::tsc_ghz();
+    if ghz <= 0.0 {
+        return;
+    }
+    let ns = |t: u64| t as f64 / ghz;
+    let n = n_tok as f64;
+    let matvecs = ks::MATVECS.load(std::sync::atomic::Ordering::Relaxed) as f64 / n;
+    let quant = ns(ks::QUANT_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
+    let dot = ns(ks::DOT_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
+    let enq = ns(ks::POOL_ENQ_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
+    let wait = ns(ks::POOL_WAIT_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
+    let wake = ks::WAKE_TICKS.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    let wake_jobs = ks::WAKE_JOBS.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
+    let wake_us = ns(wake as u64) / 1e3 / wake_jobs;
+    let parks = ks::PARKS.load(std::sync::atomic::Ordering::Relaxed);
+    let spins = ks::SPIN_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    let c_spin_wins = ks::CALLER_SPIN_WINS.load(std::sync::atomic::Ordering::Relaxed);
+    let c_parks = ks::CALLER_PARKS.load(std::sync::atomic::Ordering::Relaxed);
+    let q_allocs = ks::QUANT_ALLOC_COUNT.load(std::sync::atomic::Ordering::Relaxed) as f64 / n;
+    let q_alloc_kb = ks::QUANT_ALLOC_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1024.0 / n;
+    let wall_us = ns(ks::MATVEC_WALL_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
+    let caller_band_us = ns(ks::CALLER_BAND_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
+    let n_jobs = ks::WAKE_JOBS.load(std::sync::atomic::Ordering::Relaxed) as f64 / n;
+    println!(
+        "kstats: {matvecs:.0} matvecs/token | matvec wall {wall_us:.1} µs/tok | quantize {quant:.1} µs/tok ({q_allocs:.0} allocs, {q_alloc_kb:.0} KB) | dots {dot:.1} µs CPU/tok (both threads) | caller band {caller_band_us:.1} µs/tok | pool enqueue {enq:.1} + caller wait {wait:.1} µs/tok | worker wake {wake_us:.2} µs avg over {n_jobs:.0} jobs/token ({parks} parks / {spins} spin-hits; caller barrier: {c_spin_wins} spin-wins / {c_parks} parks)",
+        matvecs = matvecs, wall_us = wall_us, quant = quant, q_allocs = q_allocs, q_alloc_kb = q_alloc_kb,
+        dot = dot, caller_band_us = caller_band_us, enq = enq, wait = wait, wake_us = wake_us,
+        n_jobs = n_jobs, parks = parks, spins = spins, c_spin_wins = c_spin_wins, c_parks = c_parks,
+    );
 }

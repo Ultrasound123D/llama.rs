@@ -23,6 +23,8 @@
 pub mod pool;
 pub mod quant;
 pub mod scalar;
+pub mod kstats;
+pub mod amx;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
@@ -72,7 +74,9 @@ impl<'x> QAct<'x> {
     /// (`ggml-cpu/ggml-cpu.c` type_traits_cpu table):
     /// F32/F16/BF16 → F32, Q4_0/Q5_0/Q8_0 → Q8_0, Q4_K/Q5_K/Q6_K → Q8_K.
     pub fn quantize(ty: GgmlType, x: &'x [f32]) -> QAct<'x> {
-        match ty {
+        let prof = kstats::enabled();
+        let t0 = if prof { kstats::tsc() } else { 0 };
+        let r = match ty {
             GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::Q8_0 => {
                 assert!(x.len() % 32 == 0, "n_in {} not a multiple of 32", x.len());
                 let mut q = vec![0u8; x.len() / 32 * 34];
@@ -86,7 +90,18 @@ impl<'x> QAct<'x> {
                 QAct::Q8_K(q)
             }
             _ => QAct::F32(x),
+        };
+        if prof {
+            kstats::QUANT_TICKS.fetch_add(kstats::tsc().wrapping_sub(t0), std::sync::atomic::Ordering::Relaxed);
+            let (allocs, bytes) = match &r {
+                QAct::Q8_0(q) => (1u64, q.len() as u64),
+                QAct::Q8_K(q) => (1u64, q.len() as u64),
+                QAct::F32(_) => (0, 0),
+            };
+            kstats::QUANT_ALLOC_COUNT.fetch_add(allocs, std::sync::atomic::Ordering::Relaxed);
+            kstats::QUANT_ALLOC_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         }
+        r
     }
 }
 
@@ -266,6 +281,93 @@ impl SyncMutPtr {
     }
 }
 
+/// Caller-side band fraction of the column space (Phase 6.2 knob).
+/// The caller runs quantize + enqueue before its band while the worker only
+/// pays the wake latency, so a symmetric 0.5 split leaves the caller waiting
+/// for the worker's tail on every matvec. Tunable via LLAMA_RS_SPLIT
+/// (default 0.5).
+fn caller_split() -> f64 {
+    static S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("LLAMA_RS_SPLIT")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| (0.1..=0.9).contains(v))
+            .unwrap_or(0.5)
+    })
+}
+
+/// Band job factory: a contiguous column band [lo, hi) of one matvec.
+/// Returns the closure that computes it (run on caller or worker).
+#[inline]
+fn band_job<'a>(
+    ptr: SyncMutPtr,
+    data: &'a [u8],
+    y: &'a QAct,
+    ty: GgmlType,
+    row_bytes: usize,
+    n_in: usize,
+    prof: bool,
+    lo: usize,
+    hi: usize,
+    is_caller: bool,
+) -> impl FnMut() + 'a {
+    move || {
+        let t0 = if prof { kstats::tsc() } else { 0 };
+        let band = unsafe { std::slice::from_raw_parts_mut(ptr.get().add(lo), hi - lo) };
+        for (k, o) in (lo..hi).enumerate() {
+            let w = &data[o * row_bytes..(o + 1) * row_bytes];
+            band[k] = vec_dot(ty, w, y, n_in);
+        }
+        if prof {
+            let dt = kstats::tsc().wrapping_sub(t0);
+            kstats::DOT_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+            if is_caller {
+                kstats::CALLER_BAND_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Fused two-tensor band factory: columns [lo, hi) over the concatenated
+/// column space (tensor1's n_out1 columns first, then tensor2's).
+#[inline]
+fn fused_cols_job<'a>(
+    ptr1: SyncMutPtr,
+    ptr2: SyncMutPtr,
+    data1: &'a [u8],
+    data2: &'a [u8],
+    n_out1: usize,
+    y: &'a QAct,
+    ty: GgmlType,
+    row_bytes: usize,
+    n_in: usize,
+    prof: bool,
+    lo: usize,
+    hi: usize,
+    is_caller: bool,
+) -> impl FnMut() + 'a {
+    move || {
+        let t0 = if prof { kstats::tsc() } else { 0 };
+        for c in lo..hi {
+            let (ptr, data, o) = if c < n_out1 {
+                (ptr1, data1, c)
+            } else {
+                (ptr2, data2, c - n_out1)
+            };
+            let w = &data[o * row_bytes..(o + 1) * row_bytes];
+            unsafe { *ptr.get().add(o) = vec_dot(ty, w, y, n_in); }
+        }
+        if prof {
+            let dt = kstats::tsc().wrapping_sub(t0);
+            kstats::DOT_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+            if is_caller {
+                kstats::CALLER_BAND_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Parallel matvec — the Phase 6 replacement for `llama_quant::matvec`.
 ///
 /// `data` is the whole tensor `[n_in, n_out]` in ggml order (column o =
@@ -284,21 +386,83 @@ pub fn matvec(
     out: &mut [f32],
 ) {
     debug_assert_eq!(out.len(), n_out);
+    let prof = kstats::enabled();
+    let tw0 = if prof { kstats::tsc() } else { 0 };
+    if prof {
+        kstats::MATVECS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let y = QAct::quantize(ty, x);
     let row_bytes = ty.block_size() as usize * (n_in / ty.block_vals() as usize);
 
     let n_threads = n_threads.max(1);
-    // keep the chunk count modest: each chunk is a contiguous column band
-    let n_chunks = n_threads.min(n_out);
-    let chunk = (n_out + n_chunks - 1) / n_chunks;
-    let ptr = SyncMutPtr(out.as_mut_ptr());
-    pool::par_chunks(n_chunks, n_threads, &|ci: usize| {
-        let start = ci * chunk;
-        let end = ((ci + 1) * chunk).min(n_out);
-        let band = unsafe { std::slice::from_raw_parts_mut(ptr.get().add(start), end - start) };
-        for (k, o) in (start..end).enumerate() {
+    if n_threads <= 1 || n_out < 64 {
+        // sequential path (also tiny matvecs: dispatch overhead dominates)
+        for o in 0..n_out {
             let w = &data[o * row_bytes..(o + 1) * row_bytes];
-            band[k] = vec_dot(ty, w, &y, n_in);
+            out[o] = vec_dot(ty, w, &y, n_in);
         }
-    });
+    } else {
+        // 2-thread fast path: caller band + worker band, split-tunable
+        let split = caller_split();
+        let caller_end = ((n_out as f64 * split).round() as usize).clamp(1, n_out - 1);
+        let ptr = SyncMutPtr(out.as_mut_ptr());
+        let p = caller_end;
+        let caller_job = band_job(ptr, data, &y, ty, row_bytes, n_in, prof, 0, p, true);
+        let worker_job = band_job(ptr, data, &y, ty, row_bytes, n_in, prof, p, n_out, false);
+        pool::par_chunks2(caller_job, worker_job);
+    }
+    if prof {
+        kstats::MATVEC_WALL_TICKS.fetch_add(kstats::tsc().wrapping_sub(tw0), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Fused double matvec (Phase 6.2): two matrices of the SAME type sharing the
+/// SAME input vector `x` (the FFN gate/up pair), one activation quantization
+/// and ONE pool dispatch. The column space [0, g+u) is split between caller
+/// and worker so both threads finish together.
+///
+/// `out1[o] = Σ x·W1[:,o]` (n_out1 columns), `out2[o] = Σ x·W2[:,o]` (n_out2).
+pub fn matvec2(
+    ty: GgmlType,
+    data1: &[u8],
+    n_out1: usize,
+    out1: &mut [f32],
+    data2: &[u8],
+    n_out2: usize,
+    out2: &mut [f32],
+    n_in: usize,
+    x: &[f32],
+    n_threads: usize,
+) {
+    debug_assert_eq!(out1.len(), n_out1);
+    debug_assert_eq!(out2.len(), n_out2);
+    let prof = kstats::enabled();
+    let tw0 = if prof { kstats::tsc() } else { 0 };
+    if prof {
+        kstats::MATVECS.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+    }
+    let y = QAct::quantize(ty, x);
+    let row_bytes = ty.block_size() as usize * (n_in / ty.block_vals() as usize);
+    let n_threads = n_threads.max(1);
+    let total = n_out1 + n_out2;
+    if n_threads <= 1 || total < 128 {
+        for (o, w) in (0..n_out1).map(|o| (o, &data1[o * row_bytes..(o + 1) * row_bytes])) {
+            out1[o] = vec_dot(ty, w, &y, n_in);
+        }
+        for (o, w) in (0..n_out2).map(|o| (o, &data2[o * row_bytes..(o + 1) * row_bytes])) {
+            out2[o] = vec_dot(ty, w, &y, n_in);
+        }
+    } else {
+        let split = caller_split();
+        // split point in the fused column space; map back to (which tensor, col)
+        let p = ((total as f64 * split).round() as usize).clamp(1, total - 1);
+        let ptr1 = SyncMutPtr(out1.as_mut_ptr());
+        let ptr2 = SyncMutPtr(out2.as_mut_ptr());
+        let caller_job = fused_cols_job(ptr1, ptr2, data1, data2, n_out1, &y, ty, row_bytes, n_in, prof, 0, p, true);
+        let worker_job = fused_cols_job(ptr1, ptr2, data1, data2, n_out1, &y, ty, row_bytes, n_in, prof, p, total, false);
+        pool::par_chunks2(caller_job, worker_job);
+    }
+    if prof {
+        kstats::MATVEC_WALL_TICKS.fetch_add(kstats::tsc().wrapping_sub(tw0), std::sync::atomic::Ordering::Relaxed);
+    }
 }

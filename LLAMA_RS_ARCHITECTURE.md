@@ -129,3 +129,10 @@ Measurements on this VM (2 vCPU Xeon sapphirerapids, 3200 MHz, DRAM ceiling 29 G
 - Q4_K 2048×524288 (1 GB): 9.0 → **13.9 GB/s** after adding software prefetch (the single biggest win, +53%); Q6_K: 16.8 GB/s; Q8_0: 1.6 → 6.7 GB/s after inlining the 256-bit VNNI dot.
 - Full LFM3-1.7B: 0.9 → **8.7 tok/s** (llama.cpp 11.9, which loads an AVX-512 + AMX backend).
 - AVX-512 VNNI q4_K kernel: built and tested (`avx512.rs`, comparison in `examples/q4cmp.rs`) but ~9% slower than AVX2 on this VM → default dispatch stays AVX2.
+
+### Phase 6.1–6.3 addendum (performance engineering session)
+
+- **Instrumentation**: op-level TSC profiler (`llama-core/src/prof.rs`) + kernel counters (`llama-kernels/src/kstats.rs`) + `kprofile` micro-bench + `scripts/bench_decode.sh`/`profile_decode.sh`. perf_event_open is EPERM in this VM → cycles = invariant TSC; no cache-miss counters (documented in PERFORMANCE_REPORT.md).
+- **Kernels (6.1 finding → fix)**: the simple-quant kernels (Q4_0/Q5_0/Q8_0) ran at 3.4–8.7 GB/s because every 32-value block did two *software* f16→f32 conversions for the scale product. F16C hardware conversion + 2-block unroll: 11.4–14.6 GB/s; Qwen full model 9.5 → 13.1 tok/s.
+- **Scheduling (6.2)**: spin barrier + lock-free job-slot dispatch (`par_chunks2`, generation-counted CAS; `LLAMA_RS_SLOT=0` for A/B) + fused gate+up matvec (`matvec2`: one quantize + one dispatch for both same-input matrices). LFM3 dispatch A/B +14%.
+- **AMX INT8 backend (6.3)**: `llama-kernels/src/amx.rs` — runtime cpuid + XCR0 validation, load-time VNNI repack for Q8_0 (as llama.cpp) and Q5_0 (beyond llama.cpp), decode kernels on 512-bit dpbusd with the exact s8s8 compensation math, per-tensor AVX2 fallback, 5 differential tests. **Qwen2.5-0.5B: 9.5 → 23–26 tok/s (×2.5; llama.cpp 29–30)**. LFM3's tensors are Q4_K/Q6_K (outside the 6.3 type scope) — the K-quant repack is the measured next step and is llama.cpp's remaining LFM3 edge. Full data, failed experiments and gates: PERFORMANCE_REPORT.md.

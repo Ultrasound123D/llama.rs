@@ -1,6 +1,81 @@
 //! Models: LFM3 (hybrid shortconv+attention with a per-head gate and learned RoPE)
 //! + the llama family (llama1/2/3, qwen2/qwen2.5) — port of src/models/lfm3.cpp and models/llama.cpp
 use llama_gguf::{GgufFile, Value};
+use crate::prof;
+
+/// Packed (AMX/VNNI) weights keyed by tensor name — built at load time.
+pub type PackedMap = std::collections::HashMap<String, llama_kernels::amx::PackedTensor>;
+
+/// Repack eligible tensors at load time (Phase 6.3): Q8_0 and Q5_0 with
+/// n_in % 32 == 0 and n_out % 16 == 0. token_embd is excluded (it is read
+/// by column for the embedding lookup, not matvec).
+fn build_packed(gguf: &GgufFile) -> PackedMap {
+    let mut m = PackedMap::new();
+    if !llama_kernels::amx::amx_path_available() {
+        return m;
+    }
+    for t in &gguf.tensors {
+        if t.name == "token_embd.weight" {
+            continue;
+        }
+        if t.dims.len() != 2 {
+            continue;
+        }
+        let (n_in, n_out) = (t.dims[0] as usize, t.dims[1] as usize);
+        let data = gguf.tensor_bytes(t);
+        if let Some(p) = llama_kernels::amx::repack_tensor(t.ty, data, n_in, n_out) {
+            m.insert(t.name.clone(), p);
+        }
+    }
+    m
+}
+
+/// Matvec dispatch: packed AMX path when available, AVX2 otherwise.
+/// (free fn so call sites can pass &self.gguf + &mut self.s_* disjointly)
+fn pmv(
+    gguf: &GgufFile,
+    packed: &PackedMap,
+    name: &str,
+    x: &[f32],
+    out: &mut [f32],
+    n_threads: usize,
+) {
+    if let Some(p) = packed.get(name) {
+        llama_kernels::amx::matvec_amx(&p.data, p.n_in, p.n_out, x, n_threads, out);
+    } else {
+        crate::W::get(gguf, name).matvec(x, out, n_threads);
+    }
+}
+
+/// Fused pair dispatch (gate/up): packed AMX pair or the AVX2 matvec2.
+#[allow(clippy::too_many_arguments)]
+fn pmv2(
+    gguf: &GgufFile,
+    packed: &PackedMap,
+    name1: &str,
+    name2: &str,
+    x: &[f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    n_threads: usize,
+) {
+    if let (Some(p1), Some(p2)) = (packed.get(name1), packed.get(name2)) {
+        llama_kernels::amx::matvec2_amx(&p1.data, p1.n_out, &p2.data, p2.n_out, p1.n_in, x, n_threads, out1, out2);
+    } else {
+        let w1 = crate::W::get(gguf, name1);
+        let w2 = crate::W::get(gguf, name2);
+        debug_assert_eq!(w1.ty, w2.ty);
+        llama_kernels::matvec2(
+            w1.ty, w1.data, w1.n_out, out1,
+            w2.data, w2.n_out, out2,
+            w1.n_in, x, n_threads,
+        );
+    }
+}
+
+fn pbucket(name: &str) -> &'static prof::Bucket {
+    prof::bucket(name)
+}
 
 // ============ LFM3 ============
 
@@ -33,6 +108,8 @@ pub struct Lfm3 {
     pub n_ctx: usize,
     pub pos: usize,
     pub n_threads: usize,
+    /// Phase 6.3: repacked AMX/VNNI weights (Q8_0/Q5_0) by tensor name
+    packed: PackedMap,
     // scratch buffers
     s_out: Vec<f32>,
     s_gate: Vec<f32>, s_up: Vec<f32>, s_ffn: Vec<f32>,
@@ -124,6 +201,7 @@ impl Lfm3 {
             rope_freqs, is_recr, is_swa, has_post_norms: has_post,
             kv_k, kv_v, kv_len, conv_state, conv_kernels,
             n_ctx, pos: 0, n_threads,
+            packed: build_packed(&gguf),
             s_out: vec![0f32; n_embd.max(3 * n_embd)],
             s_gate: vec![0f32; n_ff], s_up: vec![0f32; n_ff], s_ffn: vec![0f32; n_ff],
             s_q: vec![0f32; n_embd], s_k: vec![0f32; n_head_kv * head_dim],
@@ -168,20 +246,38 @@ impl Lfm3 {
                 branch = rmsnorm(&branch, w, self.eps);
             }
             // residual: x = branch + x (un-normalized prev)
+            let te0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             for i in 0..n_e { x[i] = branch[i] + x[i]; }
+            if prof::prof_enabled() {
+                prof::record(pbucket("elementwise"), te0, 0);
+                prof::note_alloc(pbucket("elementwise"), n_e * 4);
+            }
 
             // ----- FFN (swiglu) -----
             let h2 = rmsnorm(&x, &self.w_ffn_norm[il], self.eps);
-            let gate = W::get(&self.gguf, &format!("blk.{il}.ffn_gate.weight"));
-            let up = W::get(&self.gguf, &format!("blk.{il}.ffn_up.weight"));
+            let gate_name = format!("blk.{il}.ffn_gate.weight");
+            let up_name = format!("blk.{il}.ffn_up.weight");
             let down = W::get(&self.gguf, &format!("blk.{il}.ffn_down.weight"));
-            gate.matvec(&h2, &mut self.s_gate, self.n_threads);
-            up.matvec(&h2, &mut self.s_up, self.n_threads);
+            // Phase 6.2/6.3: fused gate+up — one activation quantization and
+            // one pool dispatch (packed AMX pair when available)
+            let tm0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            pmv2(&self.gguf, &self.packed, &gate_name, &up_name, &h2, &mut self.s_gate, &mut self.s_up, self.n_threads);
+            if prof::prof_enabled() {
+                let gt = self.gguf.tensor(&gate_name).unwrap();
+                let gt2 = self.gguf.tensor(&up_name).unwrap();
+                let b = prof::bucket(&format!("mv blk.*.ffn_gate.weight {:?}", gt.ty));
+                b.bytes.fetch_add(self.gguf.tensor_bytes(gt).len() as u64 + self.gguf.tensor_bytes(gt2).len() as u64, std::sync::atomic::Ordering::Relaxed);
+                prof::record(b, tm0, 0);
+            }
             let mut ffn_out = swiglu_ffn(&down, &self.s_gate, &self.s_up, &mut self.s_ffn, self.n_threads);
             if let Some(w) = &self.w_post_fnorm[il] {
                 ffn_out = rmsnorm(&ffn_out, w, self.eps);
             }
+            let te1 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             for i in 0..n_e { x[i] = ffn_out[i] + x[i]; }
+            if prof::prof_enabled() {
+                prof::record(pbucket("elementwise"), te1, 0);
+            }
         }
 
         // ----- output head -----
@@ -212,6 +308,7 @@ impl Lfm3 {
         v_w.matvec(h, &mut self.s_v, self.n_threads);
 
         // q/k norm per head (q heads: 16 × 128; k heads: 4 × 128)
+        let tq0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         for hq in 0..nh {
             let s = hq * hd;
             let mut head: Vec<f32> = self.s_q[s..s + hd].to_vec();
@@ -236,12 +333,22 @@ impl Lfm3 {
             }
             self.s_k[s..s + hd].copy_from_slice(&normed);
         }
+        if prof::prof_enabled() {
+            prof::record(pbucket("attn_prep(qknorm+rope)"), tq0, 0);
+            // the loop above allocates: head to_vec + rmsnorm out per head
+            let allocs = (nh + nkv) * 2;
+            prof::note_alloc(pbucket("attn_prep(qknorm+rope)"), allocs * (hd * 4));
+        }
 
         // KV cache
         let len = self.kv_len[attn_idx];
         let off = len * nkv * hd;
+        let tk0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         self.kv_k[attn_idx][off..off + nkv * hd].copy_from_slice(&self.s_k);
         self.kv_v[attn_idx][off..off + nkv * hd].copy_from_slice(&self.s_v);
+        if prof::prof_enabled() {
+            prof::record(pbucket("kv_write"), tk0, (nkv * hd * 4 * 2) as u64);
+        }
         self.kv_len[attn_idx] = len + 1;
         let n_kv = len + 1;
 
@@ -255,6 +362,7 @@ impl Lfm3 {
         let vcache = &self.kv_v[attn_idx];
         let swa = if self.is_swa[il] { Some(self.swa_window) } else { None };
         let mut out_scratch = vec![0f32; hd];
+        let ta0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         for hq in 0..nh {
             let kvh = hq / rep;
             let qs = &self.s_q[hq * hd..(hq + 1) * hd];
@@ -265,6 +373,10 @@ impl Lfm3 {
             for i in 0..hd {
                 self.s_attn[hq * hd + i] = out_scratch[i] * g;
             }
+        }
+        if prof::prof_enabled() {
+            prof::record(pbucket("attn_core"), ta0, 0);
+            prof::note_alloc(pbucket("attn_core"), hd * 4);
         }
 
         // output projection
@@ -290,6 +402,7 @@ impl Lfm3 {
         let kernel = &self.conv_kernels[recr_idx];   // [n_embd][7]
 
         let mut y = vec![0f32; n_e];
+        let tc0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         for ch in 0..n_e {
             let bx = b[ch] * xx[ch];
             // window: state(6) + bx → sum of taps against the kernel
@@ -306,6 +419,10 @@ impl Lfm3 {
                 state[s_base + k] = state[s_base + k + 1];
             }
             state[s_base + d_conv - 1] = bx;
+        }
+        if prof::prof_enabled() {
+            prof::record(pbucket("conv_core"), tc0, 0);
+            prof::note_alloc(pbucket("conv_core"), n_e * 4);
         }
 
         let out_w = W::get(&self.gguf, &format!("blk.{il}.shortconv.out_proj.weight"));
@@ -378,6 +495,8 @@ pub struct LlamaFamily {
     kv_k: Vec<Vec<f32>>,
     kv_v: Vec<Vec<f32>>,
     kv_len: Vec<usize>,
+    /// Phase 6.3: repacked AMX/VNNI weights (Q8_0/Q5_0) by tensor name
+    packed: PackedMap,
     s_q: Vec<f32>, s_k: Vec<f32>, s_v: Vec<f32>, s_attn: Vec<f32>,
     s_gate: Vec<f32>, s_up: Vec<f32>, s_ffn: Vec<f32>, s_scores: Vec<f32>,
     logits: Vec<f32>,
@@ -426,6 +545,7 @@ impl LlamaFamily {
             n_embd, n_head, n_head_kv, head_dim, n_ff, n_layer, eps, rope_base,
             n_ctx, pos: 0, n_threads,
             kv_k, kv_v, kv_len: vec![0; n_layer],
+            packed: build_packed(&gguf),
             s_q: vec![0f32; n_embd], s_k: vec![0f32; n_head_kv * head_dim],
             s_v: vec![0f32; n_head_kv * head_dim], s_attn: vec![0f32; n_embd],
             s_gate: vec![0f32; n_ff], s_up: vec![0f32; n_ff], s_ffn: vec![0f32; n_ff],
@@ -449,17 +569,19 @@ impl LlamaFamily {
 
         for il in 0..self.n_layer {
             let h = rmsnorm(&x, &self.w_attn_norm[il], self.eps);
-            let q_w = W::get(&self.gguf, &format!("blk.{il}.attn_q.weight"));
-            let k_w = W::get(&self.gguf, &format!("blk.{il}.attn_k.weight"));
-            let v_w = W::get(&self.gguf, &format!("blk.{il}.attn_v.weight"));
-            q_w.matvec(&h, &mut self.s_q, self.n_threads);
-            k_w.matvec(&h, &mut self.s_k, self.n_threads);
-            v_w.matvec(&h, &mut self.s_v, self.n_threads);
+            let q_name = format!("blk.{il}.attn_q.weight");
+            let k_name = format!("blk.{il}.attn_k.weight");
+            let v_name = format!("blk.{il}.attn_v.weight");
+            pmv(&self.gguf, &self.packed, &q_name, &h, &mut self.s_q, self.n_threads);
+            pmv(&self.gguf, &self.packed, &k_name, &h, &mut self.s_k, self.n_threads);
+            pmv(&self.gguf, &self.packed, &v_name, &h, &mut self.s_v, self.n_threads);
+            let _ = (q_name, k_name, v_name);
             if let Some(b) = &self.b_q[il] { for i in 0..self.s_q.len() { self.s_q[i] += b[i]; } }
             if let Some(b) = &self.b_k[il] { for i in 0..self.s_k.len() { self.s_k[i] += b[i]; } }
             if let Some(b) = &self.b_v[il] { for i in 0..self.s_v.len() { self.s_v[i] += b[i]; } }
 
             // neox rope on q/k
+            let tq0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             for hq in 0..self.n_head {
                 let s = hq * self.head_dim;
                 let mut head: Vec<f32> = self.s_q[s..s + self.head_dim].to_vec();
@@ -472,12 +594,20 @@ impl LlamaFamily {
                 rope_neox_inplace(head.as_mut_slice(), pos, self.rope_base, None);
                 self.s_k[s..s + self.head_dim].copy_from_slice(&head);
             }
+            if prof::prof_enabled() {
+                prof::record(pbucket("rope_prep"), tq0, 0);
+                prof::note_alloc(pbucket("rope_prep"), (self.n_head + self.n_head_kv) * self.head_dim * 4);
+            }
 
             // cache
             let len = self.kv_len[il];
             let off = len * self.n_head_kv * self.head_dim;
+            let tk0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             self.kv_k[il][off..off + self.n_head_kv * self.head_dim].copy_from_slice(&self.s_k);
             self.kv_v[il][off..off + self.n_head_kv * self.head_dim].copy_from_slice(&self.s_v);
+            if prof::prof_enabled() {
+                prof::record(pbucket("kv_write"), tk0, (self.n_head_kv * self.head_dim * 4 * 2) as u64);
+            }
             self.kv_len[il] = len + 1;
             let n_kv = len + 1;
 
@@ -485,6 +615,7 @@ impl LlamaFamily {
             let rep = self.n_head / self.n_head_kv;
             let (kcache, vcache) = (&self.kv_k[il], &self.kv_v[il]);
             let mut out_scratch = vec![0f32; self.head_dim];
+            let ta0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             for hq in 0..self.n_head {
                 let kvh = hq / rep;
                 let qs = &self.s_q[hq * self.head_dim..(hq + 1) * self.head_dim];
@@ -492,29 +623,51 @@ impl LlamaFamily {
                     self.head_dim, None, &mut out_scratch, &mut self.s_scores);
                 self.s_attn[hq * self.head_dim..(hq + 1) * self.head_dim].copy_from_slice(&out_scratch);
             }
-            let o_w = W::get(&self.gguf, &format!("blk.{il}.attn_output.weight"));
+            if prof::prof_enabled() {
+                prof::record(pbucket("attn_core"), ta0, 0);
+                prof::note_alloc(pbucket("attn_core"), self.head_dim * 4);
+            }
+            let o_name = format!("blk.{il}.attn_output.weight");
             let mut attn_out = vec![0f32; n_e];
-            o_w.matvec(&self.s_attn, &mut attn_out, self.n_threads);
+            pmv(&self.gguf, &self.packed, &o_name, &self.s_attn, &mut attn_out, self.n_threads);
+            let te0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             for i in 0..n_e { x[i] += attn_out[i]; }
+            if prof::prof_enabled() {
+                prof::record(pbucket("elementwise"), te0, 0);
+                prof::note_alloc(pbucket("elementwise"), n_e * 4);
+            }
 
             // FFN
             let h2 = rmsnorm(&x, &self.w_ffn_norm[il], self.eps);
-            let gate = W::get(&self.gguf, &format!("blk.{il}.ffn_gate.weight"));
-            let up = W::get(&self.gguf, &format!("blk.{il}.ffn_up.weight"));
+            // Phase 6.2/6.3: fused gate+up dispatch — packed AMX pair when
+            // available, AVX2 matvec2 otherwise
+            let gate_name = format!("blk.{il}.ffn_gate.weight");
+            let up_name = format!("blk.{il}.ffn_up.weight");
             let down = W::get(&self.gguf, &format!("blk.{il}.ffn_down.weight"));
-            gate.matvec(&h2, &mut self.s_gate, self.n_threads);
-            up.matvec(&h2, &mut self.s_up, self.n_threads);
+            let tm0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            pmv2(&self.gguf, &self.packed, &gate_name, &up_name, &h2, &mut self.s_gate, &mut self.s_up, self.n_threads);
+            if prof::prof_enabled() {
+                let gt = self.gguf.tensor(&gate_name).unwrap();
+                let gt2 = self.gguf.tensor(&up_name).unwrap();
+                let b = prof::bucket(&format!("mv blk.*.ffn_gate.weight {:?}", gt.ty));
+                b.bytes.fetch_add(self.gguf.tensor_bytes(gt).len() as u64 + self.gguf.tensor_bytes(gt2).len() as u64, std::sync::atomic::Ordering::Relaxed);
+                prof::record(b, tm0, 0);
+            }
             let ffn_out = swiglu_ffn(&down, &self.s_gate, &self.s_up, &mut self.s_ffn, self.n_threads);
+            let te1 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             for i in 0..n_e { x[i] += ffn_out[i]; }
+            if prof::prof_enabled() {
+                prof::record(pbucket("elementwise"), te1, 0);
+            }
         }
 
         let xn = rmsnorm(&x, &self.w_output_norm, self.eps);
         let out_w_name = if self.gguf.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
-        let out_w = W::get(&self.gguf, out_w_name);
-        if self.logits.len() != out_w.n_out {
-            self.logits = vec![0f32; out_w.n_out];
+        if self.logits.len() != self.gguf.tensor(out_w_name).unwrap().dims[1] as usize {
+            self.logits = vec![0f32; self.gguf.tensor(out_w_name).unwrap().dims[1] as usize];
         }
-        out_w.matvec(&xn, &mut self.logits, self.n_threads);
+        let _ = out_w_name;
+        pmv(&self.gguf, &self.packed, out_w_name, &xn, &mut self.logits, self.n_threads);
         self.pos += 1;
         &self.logits
     }

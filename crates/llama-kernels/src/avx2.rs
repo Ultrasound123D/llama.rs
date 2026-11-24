@@ -26,6 +26,18 @@ mod inner {
 
     // ---------- helpers (quants.c:41-300) ----------
 
+    /// Hardware f16 → f32 (F16C `vcvtph2ps`, scalar) — the exact instruction
+    /// `GGML_CPU_FP16_TO_FP32` compiles to on x86. Used per block for the
+    /// scale product d = w.d · y.d in the simple-quant kernels; the software
+    /// fallback in llama-quant costs ~15 instructions per value and was the
+    /// dominant term in the Q4_0/Q5_0/Q8_0 dot (3.4 GB/s → measured).
+    #[inline]
+    #[target_feature(enable = "avx2,f16c")]
+    pub unsafe fn h2f(bits: u16) -> f32 {
+        let v = _mm_cvtsi32_si128(bits as i32);
+        _mm_cvtss_f32(_mm_cvtph_ps(v))
+    }
+
     #[inline]
     pub unsafe fn hsum_float_8(x: __m256) -> f32 {
         let mut res = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
@@ -92,78 +104,135 @@ mod inner {
     // ---------- simple quants ----------
 
     /// `ggml_vec_dot_q4_0_q8_0` AVX2 path + prefetch
-    #[target_feature(enable = "avx2,fma")]
+    /// F16C scale conversion + 2-block unroll with two f32 accumulators
+    /// (breaks the 4-cycle FMA dependency chain across blocks).
+    #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_q4_0_q8_0(w: &[u8], y: &[u8], n: usize) -> f32 {
         let nb = n / 32;
         let mut acc = _mm256_setzero_ps();
-        for ib in 0..nb {
+        let mut acc2 = _mm256_setzero_ps();
+        let mut ib = 0usize;
+        while ib + 2 <= nb {
             let wx = &w[ib * 18..(ib + 1) * 18];
             let wy = &y[ib * 34..(ib + 1) * 34];
-            if ib + 3 < nb {
-                _mm_prefetch(w.as_ptr().add(18 * (ib + 2)) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w.as_ptr().add(18 * (ib + 3)) as *const i8, _MM_HINT_T0);
+            let wx2 = &w[(ib + 1) * 18..(ib + 2) * 18];
+            let wy2 = &y[(ib + 1) * 34..(ib + 2) * 34];
+            if ib + 5 < nb {
+                _mm_prefetch(w.as_ptr().add(18 * (ib + 4)) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(w.as_ptr().add(18 * (ib + 5)) as *const i8, _MM_HINT_T0);
             }
-            let d = f16_to_f32(u16::from_le_bytes([wx[0], wx[1]]))
-                * f16_to_f32(u16::from_le_bytes([wy[0], wy[1]]));
-            let d = _mm256_set1_ps(d);
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let d2 = h2f(u16::from_le_bytes([wx2[0], wx2[1]])) * h2f(u16::from_le_bytes([wy2[0], wy2[1]]));
             let mut qx = bytes_from_nibbles_32(&wx[2..18]);
             let off = _mm256_set1_epi8(8);
             qx = _mm256_sub_epi8(qx, off);
             let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
-            let q = mul_sum_i8_pairs_float(qx, qy);
-            acc = _mm256_fmadd_ps(d, q, acc);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), mul_sum_i8_pairs_float(qx, qy), acc);
+            let mut qx2 = bytes_from_nibbles_32(&wx2[2..18]);
+            qx2 = _mm256_sub_epi8(qx2, off);
+            let qy2 = _mm256_loadu_si256(wy2[2..].as_ptr() as *const __m256i);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), mul_sum_i8_pairs_float(qx2, qy2), acc2);
+            ib += 2;
         }
-        hsum_float_8(acc)
+        if ib < nb {
+            let wx = &w[ib * 18..(ib + 1) * 18];
+            let wy = &y[ib * 34..(ib + 1) * 34];
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let mut qx = bytes_from_nibbles_32(&wx[2..18]);
+            let off = _mm256_set1_epi8(8);
+            qx = _mm256_sub_epi8(qx, off);
+            let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+        hsum_float_8(_mm256_add_ps(acc, acc2))
     }
 
     /// `ggml_vec_dot_q5_0_q8_0` AVX2 path + prefetch
-    #[target_feature(enable = "avx2,fma")]
+    /// F16C scale conversion + 2-block unroll (two accumulators).
+    #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_q5_0_q8_0(w: &[u8], y: &[u8], n: usize) -> f32 {
         let nb = n / 32;
         let mut acc = _mm256_setzero_ps();
-        for ib in 0..nb {
+        let mut acc2 = _mm256_setzero_ps();
+        let mut ib = 0usize;
+        while ib + 2 <= nb {
             let wx = &w[ib * 22..(ib + 1) * 22];
             let wy = &y[ib * 34..(ib + 1) * 34];
-            if ib + 3 < nb {
-                _mm_prefetch(w.as_ptr().add(22 * (ib + 2)) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w.as_ptr().add(22 * (ib + 3)) as *const i8, _MM_HINT_T0);
+            let wx2 = &w[(ib + 1) * 22..(ib + 2) * 22];
+            let wy2 = &y[(ib + 1) * 34..(ib + 2) * 34];
+            if ib + 5 < nb {
+                _mm_prefetch(w.as_ptr().add(22 * (ib + 4)) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(w.as_ptr().add(22 * (ib + 5)) as *const i8, _MM_HINT_T0);
             }
-            let d = f16_to_f32(u16::from_le_bytes([wx[0], wx[1]]))
-                * f16_to_f32(u16::from_le_bytes([wy[0], wy[1]]));
-            let d = _mm256_set1_ps(d);
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let d2 = h2f(u16::from_le_bytes([wx2[0], wx2[1]])) * h2f(u16::from_le_bytes([wy2[0], wy2[1]]));
             let mut qx = bytes_from_nibbles_32(&wx[6..22]);
             let qh: [u8; 4] = [wx[2], wx[3], wx[4], wx[5]];
             let bxhi = bytes_from_bits_32(&qh);
             let bxhi = _mm256_andnot_si256(bxhi, _mm256_set1_epi8(0xF0u8 as i8));
             qx = _mm256_or_si256(qx, bxhi);
             let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
-            let q = mul_sum_i8_pairs_float(qx, qy);
-            acc = _mm256_fmadd_ps(d, q, acc);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), mul_sum_i8_pairs_float(qx, qy), acc);
+            let mut qx2 = bytes_from_nibbles_32(&wx2[6..22]);
+            let qh2: [u8; 4] = [wx2[2], wx2[3], wx2[4], wx2[5]];
+            let bxhi2 = bytes_from_bits_32(&qh2);
+            let bxhi2 = _mm256_andnot_si256(bxhi2, _mm256_set1_epi8(0xF0u8 as i8));
+            qx2 = _mm256_or_si256(qx2, bxhi2);
+            let qy2 = _mm256_loadu_si256(wy2[2..].as_ptr() as *const __m256i);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), mul_sum_i8_pairs_float(qx2, qy2), acc2);
+            ib += 2;
         }
-        hsum_float_8(acc)
+        if ib < nb {
+            let wx = &w[ib * 22..(ib + 1) * 22];
+            let wy = &y[ib * 34..(ib + 1) * 34];
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let mut qx = bytes_from_nibbles_32(&wx[6..22]);
+            let qh: [u8; 4] = [wx[2], wx[3], wx[4], wx[5]];
+            let bxhi = bytes_from_bits_32(&qh);
+            let bxhi = _mm256_andnot_si256(bxhi, _mm256_set1_epi8(0xF0u8 as i8));
+            qx = _mm256_or_si256(qx, bxhi);
+            let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+        hsum_float_8(_mm256_add_ps(acc, acc2))
     }
 
     /// `ggml_vec_dot_q8_0_q8_0` AVX2 path + prefetch
-    #[target_feature(enable = "avx2,fma")]
+    /// F16C scale conversion + 2-block unroll (two accumulators).
+    #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_q8_0_q8_0(w: &[u8], y: &[u8], n: usize) -> f32 {
         let nb = n / 32;
         let mut acc = _mm256_setzero_ps();
-        for ib in 0..nb {
+        let mut acc2 = _mm256_setzero_ps();
+        let mut ib = 0usize;
+        while ib + 2 <= nb {
             let wx = &w[ib * 34..(ib + 1) * 34];
             let wy = &y[ib * 34..(ib + 1) * 34];
-            if ib + 3 < nb {
-                _mm_prefetch(w.as_ptr().add(34 * (ib + 2)) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w.as_ptr().add(34 * (ib + 3)) as *const i8, _MM_HINT_T0);
+            let wx2 = &w[(ib + 1) * 34..(ib + 2) * 34];
+            let wy2 = &y[(ib + 1) * 34..(ib + 2) * 34];
+            if ib + 5 < nb {
+                _mm_prefetch(w.as_ptr().add(34 * (ib + 4)) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(w.as_ptr().add(34 * (ib + 5)) as *const i8, _MM_HINT_T0);
             }
-            let d = f16_to_f32(u16::from_le_bytes([wx[0], wx[1]]))
-                * f16_to_f32(u16::from_le_bytes([wy[0], wy[1]]));
-            let d = _mm256_set1_ps(d);
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let d2 = h2f(u16::from_le_bytes([wx2[0], wx2[1]])) * h2f(u16::from_le_bytes([wy2[0], wy2[1]]));
             let qx = _mm256_loadu_si256(wx[2..].as_ptr() as *const __m256i);
             let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
-            let q = mul_sum_i8_pairs_float(qx, qy);
-            acc = _mm256_fmadd_ps(d, q, acc);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), mul_sum_i8_pairs_float(qx, qy), acc);
+            let qx2 = _mm256_loadu_si256(wx2[2..].as_ptr() as *const __m256i);
+            let qy2 = _mm256_loadu_si256(wy2[2..].as_ptr() as *const __m256i);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), mul_sum_i8_pairs_float(qx2, qy2), acc2);
+            ib += 2;
         }
-        hsum_float_8(acc)
+        if ib < nb {
+            let wx = &w[ib * 34..(ib + 1) * 34];
+            let wy = &y[ib * 34..(ib + 1) * 34];
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let qx = _mm256_loadu_si256(wx[2..].as_ptr() as *const __m256i);
+            let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+        hsum_float_8(_mm256_add_ps(acc, acc2))
     }
 
     /// Is the 256-bit VNNI dpbusd (AVX512VNNI + AVX512VL) available?
@@ -177,82 +246,127 @@ mod inner {
     /// q8_0×q8_0 with the VNNI dot-product inlined (the `__AVX512VNNI__ &&
     /// __AVX512VL__` branch of `mul_sum_us8_pairs_float`). The sign trick
     /// (|x|, y·sign(x)) keeps dpbusd's u8×i8 operands correct.
-    #[target_feature(enable = "avx2,fma,avx512vnni,avx512vl")]
+    /// F16C scale conversion + 2-block unroll (two accumulators).
+    #[target_feature(enable = "avx2,fma,f16c,avx512vnni,avx512vl")]
     pub unsafe fn dot_q8_0_q8_0_vnni(w: &[u8], y: &[u8], n: usize) -> f32 {
         let nb = n / 32;
         let zero = _mm256_setzero_si256();
         let mut acc = _mm256_setzero_ps();
-        for ib in 0..nb {
+        let mut acc2 = _mm256_setzero_ps();
+        let mut ib = 0usize;
+        while ib + 2 <= nb {
             let wx = &w[ib * 34..(ib + 1) * 34];
             let wy = &y[ib * 34..(ib + 1) * 34];
-            if ib + 3 < nb {
-                _mm_prefetch(w.as_ptr().add(34 * (ib + 2)) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w.as_ptr().add(34 * (ib + 3)) as *const i8, _MM_HINT_T0);
+            let wx2 = &w[(ib + 1) * 34..(ib + 2) * 34];
+            let wy2 = &y[(ib + 1) * 34..(ib + 2) * 34];
+            if ib + 5 < nb {
+                _mm_prefetch(w.as_ptr().add(34 * (ib + 4)) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(w.as_ptr().add(34 * (ib + 5)) as *const i8, _MM_HINT_T0);
             }
-            let d = f16_to_f32(u16::from_le_bytes([wx[0], wx[1]]))
-                * f16_to_f32(u16::from_le_bytes([wy[0], wy[1]]));
-            let d = _mm256_set1_ps(d);
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let d2 = h2f(u16::from_le_bytes([wx2[0], wx2[1]])) * h2f(u16::from_le_bytes([wy2[0], wy2[1]]));
             let qx = _mm256_loadu_si256(wx[2..].as_ptr() as *const __m256i);
             let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
             // sign trick then VNNI dot product
             let ax = _mm256_sign_epi8(qx, qx);
             let sy = _mm256_sign_epi8(qy, qx);
-            let summed = _mm256_dpbusd_epi32(zero, ax, sy);
-            let q = _mm256_cvtepi32_ps(summed);
-            acc = _mm256_fmadd_ps(d, q, acc);
+            let q = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax, sy));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), q, acc);
+            let qx2 = _mm256_loadu_si256(wx2[2..].as_ptr() as *const __m256i);
+            let qy2 = _mm256_loadu_si256(wy2[2..].as_ptr() as *const __m256i);
+            let ax2 = _mm256_sign_epi8(qx2, qx2);
+            let sy2 = _mm256_sign_epi8(qy2, qx2);
+            let q2 = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax2, sy2));
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), q2, acc2);
+            ib += 2;
         }
-        hsum_float_8(acc)
+        if ib < nb {
+            let wx = &w[ib * 34..(ib + 1) * 34];
+            let wy = &y[ib * 34..(ib + 1) * 34];
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let qx = _mm256_loadu_si256(wx[2..].as_ptr() as *const __m256i);
+            let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
+            let ax = _mm256_sign_epi8(qx, qx);
+            let sy = _mm256_sign_epi8(qy, qx);
+            let q = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax, sy));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), q, acc);
+        }
+        hsum_float_8(_mm256_add_ps(acc, acc2))
     }
 
     /// q4_0×q8_0 with the VNNI dot-product inlined (q4 nibbles are already
     /// unsigned, so no sign trick is needed for the u8×i8 dpbusd).
-    #[target_feature(enable = "avx2,fma,avx512vnni,avx512vl")]
+    /// F16C scale conversion + 2-block unroll (two accumulators).
+    #[target_feature(enable = "avx2,fma,f16c,avx512vnni,avx512vl")]
     pub unsafe fn dot_q4_0_q8_0_vnni(w: &[u8], y: &[u8], n: usize) -> f32 {
         let nb = n / 32;
         let zero = _mm256_setzero_si256();
         let mut acc = _mm256_setzero_ps();
-        for ib in 0..nb {
+        let mut acc2 = _mm256_setzero_ps();
+        let mut ib = 0usize;
+        while ib + 2 <= nb {
             let wx = &w[ib * 18..(ib + 1) * 18];
             let wy = &y[ib * 34..(ib + 1) * 34];
-            if ib + 3 < nb {
-                _mm_prefetch(w.as_ptr().add(18 * (ib + 2)) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w.as_ptr().add(18 * (ib + 3)) as *const i8, _MM_HINT_T0);
+            let wx2 = &w[(ib + 1) * 18..(ib + 2) * 18];
+            let wy2 = &y[(ib + 1) * 34..(ib + 2) * 34];
+            if ib + 5 < nb {
+                _mm_prefetch(w.as_ptr().add(18 * (ib + 4)) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(w.as_ptr().add(18 * (ib + 5)) as *const i8, _MM_HINT_T0);
             }
-            let d = f16_to_f32(u16::from_le_bytes([wx[0], wx[1]]))
-                * f16_to_f32(u16::from_le_bytes([wy[0], wy[1]]));
-            let d = _mm256_set1_ps(d);
-            // nibbles-8: qx = nibble - 8 as i8 — the sum trick: (q+8) unsigned
-            // with the -8×Σq8 correction via the y-block sum.
-            // Simpler and exact: use the sign trick on the signed q4 values.
-            let qx_u = bytes_from_nibbles_32(&wx[2..18]); // 0..15
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let d2 = h2f(u16::from_le_bytes([wx2[0], wx2[1]])) * h2f(u16::from_le_bytes([wy2[0], wy2[1]]));
             let off = _mm256_set1_epi8(8);
-            let qx = _mm256_sub_epi8(qx_u, off); // -8..7 (signed)
+            let qx = bytes_from_nibbles_32(&wx[2..18]); // 0..15
+            let qx = _mm256_sub_epi8(qx, off); // -8..7 (signed)
             let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
             let ax = _mm256_sign_epi8(qx, qx);
             let sy = _mm256_sign_epi8(qy, qx);
-            let summed = _mm256_dpbusd_epi32(zero, ax, sy);
-            let q = _mm256_cvtepi32_ps(summed);
-            acc = _mm256_fmadd_ps(d, q, acc);
+            let q = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax, sy));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), q, acc);
+            let qx2 = bytes_from_nibbles_32(&wx2[2..18]);
+            let qx2 = _mm256_sub_epi8(qx2, off);
+            let qy2 = _mm256_loadu_si256(wy2[2..].as_ptr() as *const __m256i);
+            let ax2 = _mm256_sign_epi8(qx2, qx2);
+            let sy2 = _mm256_sign_epi8(qy2, qx2);
+            let q2 = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax2, sy2));
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), q2, acc2);
+            ib += 2;
         }
-        hsum_float_8(acc)
+        if ib < nb {
+            let wx = &w[ib * 18..(ib + 1) * 18];
+            let wy = &y[ib * 34..(ib + 1) * 34];
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let off = _mm256_set1_epi8(8);
+            let qx = _mm256_sub_epi8(bytes_from_nibbles_32(&wx[2..18]), off);
+            let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
+            let ax = _mm256_sign_epi8(qx, qx);
+            let sy = _mm256_sign_epi8(qy, qx);
+            let q = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax, sy));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), q, acc);
+        }
+        hsum_float_8(_mm256_add_ps(acc, acc2))
     }
 
     /// q5_0×q8_0 with the VNNI dot-product inlined (signed values → sign trick).
-    #[target_feature(enable = "avx2,fma,avx512vnni,avx512vl")]
+    /// F16C scale conversion + 2-block unroll (two accumulators).
+    #[target_feature(enable = "avx2,fma,f16c,avx512vnni,avx512vl")]
     pub unsafe fn dot_q5_0_q8_0_vnni(w: &[u8], y: &[u8], n: usize) -> f32 {
         let nb = n / 32;
         let zero = _mm256_setzero_si256();
         let mut acc = _mm256_setzero_ps();
-        for ib in 0..nb {
+        let mut acc2 = _mm256_setzero_ps();
+        let mut ib = 0usize;
+        while ib + 2 <= nb {
             let wx = &w[ib * 22..(ib + 1) * 22];
             let wy = &y[ib * 34..(ib + 1) * 34];
-            if ib + 3 < nb {
-                _mm_prefetch(w.as_ptr().add(22 * (ib + 2)) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(w.as_ptr().add(22 * (ib + 3)) as *const i8, _MM_HINT_T0);
+            let wx2 = &w[(ib + 1) * 22..(ib + 2) * 22];
+            let wy2 = &y[(ib + 1) * 34..(ib + 2) * 34];
+            if ib + 5 < nb {
+                _mm_prefetch(w.as_ptr().add(22 * (ib + 4)) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(w.as_ptr().add(22 * (ib + 5)) as *const i8, _MM_HINT_T0);
             }
-            let d = f16_to_f32(u16::from_le_bytes([wx[0], wx[1]]))
-                * f16_to_f32(u16::from_le_bytes([wy[0], wy[1]]));
-            let d = _mm256_set1_ps(d);
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let d2 = h2f(u16::from_le_bytes([wx2[0], wx2[1]])) * h2f(u16::from_le_bytes([wy2[0], wy2[1]]));
             let mut qx = bytes_from_nibbles_32(&wx[6..22]);
             let qh: [u8; 4] = [wx[2], wx[3], wx[4], wx[5]];
             let bxhi = bytes_from_bits_32(&qh);
@@ -261,11 +375,36 @@ mod inner {
             let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
             let ax = _mm256_sign_epi8(qx, qx);
             let sy = _mm256_sign_epi8(qy, qx);
-            let summed = _mm256_dpbusd_epi32(zero, ax, sy);
-            let q = _mm256_cvtepi32_ps(summed);
-            acc = _mm256_fmadd_ps(d, q, acc);
+            let q = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax, sy));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), q, acc);
+            let mut qx2 = bytes_from_nibbles_32(&wx2[6..22]);
+            let qh2: [u8; 4] = [wx2[2], wx2[3], wx2[4], wx2[5]];
+            let bxhi2 = bytes_from_bits_32(&qh2);
+            let bxhi2 = _mm256_andnot_si256(bxhi2, _mm256_set1_epi8(0xF0u8 as i8));
+            qx2 = _mm256_or_si256(qx2, bxhi2);
+            let qy2 = _mm256_loadu_si256(wy2[2..].as_ptr() as *const __m256i);
+            let ax2 = _mm256_sign_epi8(qx2, qx2);
+            let sy2 = _mm256_sign_epi8(qy2, qx2);
+            let q2 = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax2, sy2));
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2), q2, acc2);
+            ib += 2;
         }
-        hsum_float_8(acc)
+        if ib < nb {
+            let wx = &w[ib * 22..(ib + 1) * 22];
+            let wy = &y[ib * 34..(ib + 1) * 34];
+            let d = h2f(u16::from_le_bytes([wx[0], wx[1]])) * h2f(u16::from_le_bytes([wy[0], wy[1]]));
+            let mut qx = bytes_from_nibbles_32(&wx[6..22]);
+            let qh: [u8; 4] = [wx[2], wx[3], wx[4], wx[5]];
+            let bxhi = bytes_from_bits_32(&qh);
+            let bxhi = _mm256_andnot_si256(bxhi, _mm256_set1_epi8(0xF0u8 as i8));
+            qx = _mm256_or_si256(qx, bxhi);
+            let qy = _mm256_loadu_si256(wy[2..].as_ptr() as *const __m256i);
+            let ax = _mm256_sign_epi8(qx, qx);
+            let sy = _mm256_sign_epi8(qy, qx);
+            let q = _mm256_cvtepi32_ps(_mm256_dpbusd_epi32(zero, ax, sy));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d), q, acc);
+        }
+        hsum_float_8(_mm256_add_ps(acc, acc2))
     }
 
     // ---------- K-quants ----------

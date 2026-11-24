@@ -9,3 +9,4 @@ description = "llama.rs CLI: generate / chat / tokenize / bench"
 llama-core = { path = "../../crates/llama-core" }
 llama-gguf = { path = "../../crates/llama-gguf" }
 llama-quant = { path = "../../crates/llama-quant" }
+llama-kernels = { path = "../../crates/llama-kernels" }
