@@ -55,6 +55,13 @@ pub fn prof_enabled() -> bool {
     *E.get_or_init(|| std::env::var("LLAMA_RS_PROF").is_ok())
 }
 
+/// Machine-readable profile output for scripts (Phase 6.6): tab-separated
+/// rows instead of the human table — `scripts/audit.sh` parses these.
+pub fn prof_tsv() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var("LLAMA_RS_PROF_TSV").is_ok())
+}
+
 /// Calibrated TSC frequency in GHz (0 if not initialized).
 pub fn tsc_ghz() -> f64 {
     TSC_GHZ.load(Ordering::Relaxed) as f64 / TSC_NS_NUM as f64
@@ -221,22 +228,46 @@ pub fn decode_end(t0: u64, n_tokens: u64) {
     DECODE_TOKENS.fetch_add(n_tokens, Ordering::Relaxed);
 }
 
-/// Human-readable report: per-op time per token, % of decode wall time,
-/// effective bandwidth for traffic-carrying ops, allocation counts.
+/// Human-readable report: per-op time per token, % of phase wall time,
+/// effective bandwidth for traffic-carrying ops, MB of traffic per token,
+/// allocation counts. TSV mode (`LLAMA_RS_PROF_TSV=1`) emits machine-
+/// readable rows for the Phase 6.6 audit scripts.
 pub fn report() -> String {
     let ghz = TSC_GHZ.load(Ordering::Relaxed) as f64 / TSC_NS_NUM as f64;
     let mut out = String::new();
-    out.push_str(&format!(
-        "\n==== llama.rs op profile (TSC calibration: {ghz:.4} GHz) ====\n"
-    ));
     let snaps = snapshot();
     let n_tok = DECODE_TOKENS.load(Ordering::Relaxed).max(1) as f64;
     let wall_ns = tsc_to_ns(DECODE_TICKS.load(Ordering::Relaxed));
-    // sort by time desc
+    let wall_ms_per_tok = wall_ns as f64 / 1e6 / n_tok;
     let mut s = snaps;
     s.sort_by(|a, b| b.ticks.cmp(&a.ticks));
-    out.push_str("op                              calls/tok   µs/tok    %wall   GB/s   allocs/tok  allocKB/tok\n");
-    out.push_str("---------------------------------------------------------------------------------------------\n");
+    if prof_tsv() {
+        out.push_str("#prof-tsv\tname\tus_per_tok\tpct_wall\tGBps\tMB_per_tok\tcalls_per_tok\tallocs_per_tok\n");
+        for b in &s {
+            if b.ticks == 0 && b.calls == 0 && b.allocs == 0 {
+                continue;
+            }
+            let us = b.ns as f64 / 1e3 / n_tok;
+            let pct = 100.0 * b.ns as f64 / wall_ns.max(1) as f64;
+            let mb = b.bytes as f64 / 1e6 / n_tok;
+            let gbs = if b.bytes > 0 {
+                b.bytes as f64 / 1e9 / (b.ns as f64 / 1e9).max(1e-12)
+            } else {
+                0.0
+            };
+            out.push_str(&format!(
+                "prof-tsv\t{}\t{:.3}\t{:.2}\t{:.3}\t{:.4}\t{:.1}\t{:.1}\n",
+                b.name, us, pct, gbs, mb, b.calls as f64 / n_tok, b.allocs as f64 / n_tok
+            ));
+        }
+        out.push_str(&format!("#prof-tsv-wall\t{:.4}\tms_per_tok\ttokens\t{}\n", wall_ms_per_tok, DECODE_TOKENS.load(Ordering::Relaxed)));
+        return out;
+    }
+    out.push_str(&format!(
+        "\n==== llama.rs op profile (TSC calibration: {ghz:.4} GHz) ====\n"
+    ));
+    out.push_str("op                              calls/tok   µs/tok    %wall   GB/s   MB/tok  allocs/tok  allocKB/tok\n");
+    out.push_str("---------------------------------------------------------------------------------------------------------\n");
     for b in &s {
         if b.ticks == 0 && b.calls == 0 && b.allocs == 0 {
             continue;
@@ -249,23 +280,25 @@ pub fn report() -> String {
         } else {
             0.0
         };
+        let mb = b.bytes as f64 / 1e6 / n_tok;
         let allocs = b.allocs as f64 / n_tok;
         let akb = b.alloc_bytes as f64 / 1024.0 / n_tok;
         out.push_str(&format!(
-            "{:<32} {:>7.1} {:>8.2} {:>6.1}% {:>6.2} {:>8.1} {:>9.1}\n",
+            "{:<32} {:>7.1} {:>8.2} {:>6.1}% {:>6.2} {:>6.2} {:>8.1} {:>9.1}\n",
             truncate(&b.name, 32),
             calls,
             us,
             pct,
             gbs,
+            mb,
             allocs,
             akb
         ));
     }
     out.push_str(&format!(
-        "decode wall: {} tokens, {:.1} ms/token\n",
+        "phase wall: {} tokens, {:.1} ms/token\n",
         n_tok as u64,
-        wall_ns as f64 / 1e6 / n_tok
+        wall_ms_per_tok
     ));
     out
 }

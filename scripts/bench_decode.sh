@@ -51,7 +51,7 @@ bench_cpp_both() { # model n_pp -> "pp tg" (llama-bench mean over its internal r
 
 echo "reps=$REPS n=$N threads=$THREADS ctx=$CTX (prefill and decode measured separately; all runs shown, medians compared)"
 echo
-for m in "$LFM" "$QWEN"; do
+for m in ${MODELS:-"$LFM" "$QWEN"}; do
     name=$(basename "$m" .gguf)
     # exact matched prompt length: our natural prompt tokenizes to NPP tokens
     # per model tokenizer; llama-bench synthesizes exactly the same count

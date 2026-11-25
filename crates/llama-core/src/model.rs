@@ -171,9 +171,15 @@ fn pgemm(
     n_threads: usize,
     out: &mut [f32],
 ) {
-    let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
     if let Some(p) = packed.get(name) {
+        // Phase 6.6: activation quantization and GEMM timed separately (stage
+        // attribution for the prefill audit)
+        let tq0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         let q = llama_kernels::vnni::quantize_batch(p.ty, &x_rows[..p.n_in * m], p.n_in, m, n_threads);
+        if prof::prof_enabled() {
+            prof::record(prof::bucket("act_quantize(batch)"), tq0, (p.n_in * m * 4) as u64);
+        }
+        let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         llama_kernels::vnni::gemm_prepared(p, &q, n_threads, out);
         if prof::prof_enabled() {
             if let Some(t) = gguf.tensor(name) {
@@ -209,8 +215,13 @@ fn pgemm2(
 ) {
     if let (Some(p1), Some(p2)) = (packed.get(name1), packed.get(name2)) {
         if p1.ty == p2.ty && p1.n_in == p2.n_in {
-            let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            // Phase 6.6: activation quantization and GEMM timed separately
+            let tq0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             let q = llama_kernels::vnni::quantize_batch(p1.ty, &x_rows[..p1.n_in * m], p1.n_in, m, n_threads);
+            if prof::prof_enabled() {
+                prof::record(prof::bucket("act_quantize(batch)"), tq0, (p1.n_in * m * 4) as u64);
+            }
+            let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             llama_kernels::vnni::gemm2_prepared(p1, p2, &q, n_threads, out1, out2);
             if prof::prof_enabled() {
                 let bytes = |n: &str| gguf.tensor(n).map(|t| gguf.tensor_bytes(t).len() as u64).unwrap_or(0);
@@ -240,7 +251,6 @@ fn pgemm_shared(
     n_threads: usize,
     outs: &mut [&mut [f32]],
 ) {
-    let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
     // linear bucket scan (GgmlType has no Hash; ≤ 2 buckets in practice)
     let mut buckets: Vec<((llama_gguf::GgmlType, usize), Vec<usize>)> = Vec::new();
     let mut plain: Vec<usize> = Vec::new();
@@ -257,9 +267,18 @@ fn pgemm_shared(
         }
     }
     for ((ty, n_in), idxs) in buckets {
+        // Phase 6.6: the shared quantization is timed once per type bucket
+        // and each GEMM per tensor — the previous single shared t0 inflated
+        // the q/k/v triple (each row counted the elapsed time of its
+        // predecessors).
+        let tq0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         let q = llama_kernels::vnni::quantize_batch(ty, &x_rows[..n_in * m], n_in, m, n_threads);
+        if prof::prof_enabled() {
+            prof::record(prof::bucket("act_quantize(batch)"), tq0, (n_in * m * 4) as u64);
+        }
         for &i in &idxs {
             let p = packed.get(names[i]).unwrap();
+            let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             llama_kernels::vnni::gemm_prepared(p, &q, n_threads, outs[i]);
             if prof::prof_enabled() {
                 if let Some(t) = gguf.tensor(names[i]) {
@@ -760,6 +779,7 @@ impl Lfm3 {
         for il in 0..self.n_layer {
             // ---- attn_norm rows ----
             {
+                let te0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let w = &self.w_attn_norm[il];
                 let (x, h) = (&b.x, &mut b.h);
                 if m >= 2 {
@@ -781,6 +801,7 @@ impl Lfm3 {
                 } else {
                     for r in 0..m { rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.h[r * n_e..][..n_e]); }
                 }
+                if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te0, 0); }
             }
 
             // ---- token mixer ----
@@ -792,6 +813,7 @@ impl Lfm3 {
                 attn_idx += 1;
             }
             // post_attention_norm rows (in place on the mixer output)
+            let te1 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             if let Some(w) = &self.w_post_anorm[il] {
                 let w = w;
                 let branch = &mut b.branch[..m * n_e];
@@ -807,11 +829,14 @@ impl Lfm3 {
                     for i in 0..n_e { xr[i] += brr[i]; }
                 }
             }
+            if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te1, 0); }
 
             // ---- FFN ----
             {
+                let te2 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let w = &self.w_ffn_norm[il];
                 for r in 0..m { rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.ffn_h[r * n_e..][..n_e]); }
+                if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te2, 0); }
             }
             {
                 let gate_name = format!("blk.{il}.ffn_gate.weight");
@@ -821,18 +846,21 @@ impl Lfm3 {
             }
             // swiglu rows
             {
+                let tw0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let (g, u, f) = (&b.gate, &b.up, &mut b.ffni);
                 let n_ff = self.n_ff;
                 for r in 0..m {
                     let (gr, ur, fr) = (&g[r * n_ff..][..n_ff], &u[r * n_ff..][..n_ff], &mut f[r * n_ff..][..n_ff]);
                     for i in 0..n_ff { fr[i] = silu(gr[i]) * ur[i]; }
                 }
+                if prof::prof_enabled() { prof::record(pbucket("swiglu(batch)"), tw0, 0); }
             }
             {
                 let down_name = format!("blk.{il}.ffn_down.weight");
                 let (gguf, packed) = (&self.gguf, &self.packed);
                 pgemm(gguf, packed, &down_name, &b.ffni, m, nt, &mut b.ffn_out);
             }
+            let te3 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             if let Some(w) = &self.w_post_fnorm[il] {
                 let w = w;
                 let ffn_out = &mut b.ffn_out[..m * n_e];
@@ -847,6 +875,7 @@ impl Lfm3 {
                     for i in 0..n_e { xr[i] += fr[i]; }
                 }
             }
+            if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te3, 0); }
 
         }
 
@@ -901,6 +930,7 @@ impl Lfm3 {
         }
 
         // q/k norm + rope per (row, head) — rows split between threads
+        let tq0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         {
             let w_q = &self.w_q_norm[il];
             let w_k = &self.w_k_norm[il];
@@ -932,11 +962,16 @@ impl Lfm3 {
                         pos0 + r, w_q, w_k, eps, is_swa, base_full, base_swa, freqs);
                 }
             }
+            if prof::prof_enabled() { prof::record(pbucket("attn_prep(qknorm+rope)(batch)"), tq0, 0); }
         }
 
         // head gates: sigmoid per element
-        for v in b.gate_h[..m * nh].iter_mut() {
-            *v = sigmoid(*v);
+        {
+            let tg0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            for v in b.gate_h[..m * nh].iter_mut() {
+                *v = sigmoid(*v);
+            }
+            if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), tg0, 0); }
         }
 
         // KV append (M rows)
@@ -1018,6 +1053,7 @@ impl Lfm3 {
 
         // build the channel-major window [ch][d_conv + M]: old state, then
         // this batch's bx values (b·x per row)
+        let tc0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         {
             let state = &self.conv_state[recr_idx];
             let inproj = &b.in_proj[..m * 3 * n_e];
@@ -1083,6 +1119,7 @@ impl Lfm3 {
                 }
             }
         }
+        if prof::prof_enabled() { prof::record(pbucket("conv_core(batch)"), tc0, 0); }
 
         // out_proj GEMM → mixer output rows (b.branch)
         {
@@ -1526,10 +1563,12 @@ impl LlamaFamily {
         for il in 0..self.n_layer {
             // attn_norm rows
             {
+                let te0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let w = &self.w_attn_norm[il];
                 for r in 0..m {
                     rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.h[r * n_e..][..n_e]);
                 }
+                if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te0, 0); }
             }
             // q/k/v GEMMs (shared quantization per type)
             {
@@ -1546,6 +1585,7 @@ impl LlamaFamily {
                 pgemm_shared(gguf, packed, &names, h, m, nt, &mut outs);
             }
             // biases per row
+            let tb0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             if let Some(bq) = &self.b_q[il] {
                 for r in 0..m {
                     for i in 0..n_e { b.q[r * n_e + i] += bq[i]; }
@@ -1561,8 +1601,10 @@ impl LlamaFamily {
                     for i in 0..v_row { b.v[r * v_row + i] += bv[i]; }
                 }
             }
+            if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), tb0, 0); }
             // neox rope per row/head
             {
+                let tr0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let rope_base = self.rope_base;
                 let (q, k) = (&mut b.q[..m * n_e], &mut b.k[..m * k_row]);
                 if m >= 2 {
@@ -1585,6 +1627,7 @@ impl LlamaFamily {
                         rope_row(&mut b.q[r * n_e..][..n_e], &mut b.k[r * k_row..][..k_row], pos0 + r, hd, rope_base);
                     }
                 }
+                if prof::prof_enabled() { prof::record(pbucket("rope_prep(batch)"), tr0, 0); }
             }
             // KV append
             {
@@ -1638,17 +1681,21 @@ impl LlamaFamily {
                 let (gguf, packed) = (&self.gguf, &self.packed);
                 let (attn, x) = (&b.attn[..m * n_e], &mut b.x[..m * n_e]);
                 pgemm(gguf, packed, &o_name, attn, m, nt, &mut b.ffn_out[..m * n_e]);
+                let te1 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 for r in 0..m {
                     let (xr, fr) = (&mut x[r * n_e..][..n_e], &b.ffn_out[r * n_e..][..n_e]);
                     for i in 0..n_e { xr[i] += fr[i]; }
                 }
+                if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te1, 0); }
             }
             // FFN: norm rows, fused gate/up GEMM, swiglu rows, down GEMM
             {
+                let te0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let w = &self.w_ffn_norm[il];
                 for r in 0..m {
                     rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.ffn_h[r * n_e..][..n_e]);
                 }
+                if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te0, 0); }
             }
             {
                 let gate_name = format!("blk.{il}.ffn_gate.weight");
@@ -1658,12 +1705,14 @@ impl LlamaFamily {
                 pgemm2(gguf, packed, &gate_name, &up_name, ffn_h, m, nt, gate, up);
             }
             {
+                let tw0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let (g, u, f) = (&b.gate[..m * self.n_ff], &b.up[..m * self.n_ff], &mut b.ffni[..m * self.n_ff]);
                 let n_ff = self.n_ff;
                 for r in 0..m {
                     let (gr, ur, fr) = (&g[r * n_ff..][..n_ff], &u[r * n_ff..][..n_ff], &mut f[r * n_ff..][..n_ff]);
                     for i in 0..n_ff { fr[i] = silu(gr[i]) * ur[i]; }
                 }
+                if prof::prof_enabled() { prof::record(pbucket("swiglu(batch)"), tw0, 0); }
             }
             {
                 let down_name = format!("blk.{il}.ffn_down.weight");
@@ -1673,11 +1722,13 @@ impl LlamaFamily {
 
             }
             {
+                let te2 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let (x, fo) = (&mut b.x[..m * n_e], &b.ffn_out[..m * n_e]);
                 for r in 0..m {
                     let (xr, fr) = (&mut x[r * n_e..][..n_e], &fo[r * n_e..][..n_e]);
                     for i in 0..n_e { xr[i] += fr[i]; }
                 }
+                if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te2, 0); }
             }
 
         }

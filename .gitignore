@@ -2,3 +2,4 @@
 *.gguf
 *.tmp
 .DS_Store
+audit/

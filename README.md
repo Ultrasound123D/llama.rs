@@ -2,7 +2,7 @@
 
 A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage**, output-compatible with llama.cpp — proven by automated parity tests (24/24 passing).
 
-## Status (v0.2 — Phases 0–6.5 complete)
+## Status (v0.3 — Phases 0–6.6 complete)
 
 | Feature | Status | Evidence |
 |---|---|---|
@@ -18,6 +18,7 @@ A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage*
 | **Phase 6.3–6.4 packed VNNI decode path** (load-time repack of Q8_0/Q5_0/Q4_K/Q6_K) | ✅ | LFM3 decode at **101–102 % of llama.cpp** (30-rep campaign, median [P10 P90]) |
 | **Phase 6.5 batched prefill (M>1 packed GEMM)** | ✅ | LFM3 pp **12 → 54 tok/s (4.5×)**; **Qwen pp at 102 % of llama.cpp** (154.7 vs 152.0); Qwen pp512 sweep M∈{1,8,32,128,512}; parity 24/24 |
 | **Phase 6.5 memory reclaim** (madvise of repacked originals) | ✅ | LFM3 peak RSS **2050 → 1227 MB**; Qwen **1079 → 706 MB** steady / 724 peak |
+| **Phase 6.6 Decode & Kernel Bottleneck Audit** (stage profiling, DRAM-ceiling accounting, CPU-counter probe, ctx/batch sweeps) | ✅ | every remaining gap classified with evidence (`PERFORMANCE_REPORT.md` §9): decode is kernel-limited (not memory — LFM3 streams 12.2 GB/s, equal to llama.cpp); prefill is instruction-throughput bound; **new: the per-key f32 attention core is 54 % of Qwen prefill and up to 72 % of long-context decode** |
 
 ## Build & run
 
@@ -49,7 +50,16 @@ cargo build --release
 - `LLAMA_RS_MEM_KEEP=1` — keep the original tensor bytes resident (disable the madvise reclaim)
 - `LLAMA_RS_VNNI=0` — disable the packed VNNI path (AVX2 fallback everywhere)
 - `LLAMA_RS_SLOT=0` / `LLAMA_RS_SPLIT` — dispatch-path and band-split knobs
-- `LLAMA_RS_PROF=1` — op-level TSC profile; `LLAMA_RS_PROF_PP=1` — prefill-phase profile (bench mode)
+- `LLAMA_RS_PROF=1` — op-level TSC profile; `LLAMA_RS_PROF_PP=1` — prefill-phase profile (bench mode); `LLAMA_RS_PROF_TSV=1` — machine-readable rows (`scripts/audit.sh` parses them)
+
+### Audit tooling (Phase 6.6)
+
+```bash
+bash scripts/audit.sh 3                      # stage tables (decode + prefill) for both models + DRAM ceiling + perf probe
+MODELS=<model> bash scripts/bench_ctx.sh      # decode vs context length (llama.rs vs llama-bench)
+cargo run --release --example perfcheck --manifest-path crates/llama-kernels/Cargo.toml  # perf_event_open availability probe
+cargo run --release --example drambw   --manifest-path crates/llama-kernels/Cargo.toml  # DRAM streaming ceiling
+```
 
 ## Parity tests (llama.cpp as golden reference)
 
@@ -79,11 +89,11 @@ Synthetic unit tests (hand-built GGUF + hand-computed quantization blocks) run i
 
 ## v0 limits (full honesty)
 
-- **Throughput vs llama.cpp on this VM** (matched 2-thread benchmark with exactly-matched prompt lengths, prefill/decode measured separately, medians): **LFM3-1.7B decode 12.02 vs 11.74 tok/s — 102%, faster than llama.cpp**; Qwen2.5-0.5B decode 23.86 vs 30.34 tok/s (79%). Prefill: 12.06 / 24.94 vs 88.94 / 154.91 tok/s — llama.rs prefills token-by-token while llama.cpp batches the whole prompt (M>1, where its real AMX tile kernels run); **batched prefill is the largest remaining gap**. All quantized decode tensors — Q8_0/Q5_0 *and* the K-quants Q4_K/Q6_K — now run on the repacked-VNNI M=1 route (ported from llama.cpp's AMX backend as `llama-kernels/src/vnni.rs` — AVX-512 VNNI; no AMX tile instructions are executed by this engine), and that path is **verified against an independent C golden built from llama.cpp's own quantizer and vec_dot sources** (byte-exact quantizers, 1e-7-of-term-energy agreement across 153 randomized + edge cases — see `PERFORMANCE_REPORT.md` §3.4). Same-binary A/B: the packed path alone lifts LFM3 decode 8.85 → 12.02 tok/s (+36%). Honest cost: the packed map co-resides with the original weights (~2× model RAM, the same trade llama.cpp's AMX repack makes).
+- **Throughput vs llama.cpp on this VM** (matched 2-thread benchmark with exactly-matched prompt lengths, prefill/decode measured separately, medians): **LFM3-1.7B decode 101–104 % of llama.cpp**; **Qwen2.5-0.5B prefill 101–102 %**; remaining gaps (Qwen decode 77–85 %, LFM3 prefill 42–62 %) are classified with measurements in `PERFORMANCE_REPORT.md` §9 — the largest single terms are the attention core (54 % of Qwen prefill; up to 72 % of decode at ctx ≈ 4k) and the shuffle-bound GEMM at M ≥ 64. All quantized decode tensors — Q8_0/Q5_0 *and* the K-quants Q4_K/Q6_K — now run on the repacked-VNNI M=1 route (ported from llama.cpp's AMX backend as `llama-kernels/src/vnni.rs` — AVX-512 VNNI; no AMX tile instructions are executed by this engine), and that path is **verified against an independent C golden built from llama.cpp's own quantizer and vec_dot sources** (byte-exact quantizers, 1e-7-of-term-energy agreement across 153 randomized + edge cases — see `PERFORMANCE_REPORT.md` §3.4). Same-binary A/B: the packed path alone lifts LFM3 decode 8.85 → 12.02 tok/s (+36%). Memory: the madvise reclaim keeps RSS at ~1.05× model (peak 1227 MB LFM3 / 724 MB Qwen).
 - An AVX-512 VNNI q4_K kernel exists (`llama-kernels/src/avx512.rs`, `examples/q4cmp.rs`) but measured ~9% slower than AVX2 on this VM (frequency licensing) — kept off the default dispatch.
 - No HTTP server/batching/GPU yet (Phase 7); two supported architectures (Phase 8 expands this).
 - Chat template subset (no full jinja).
-- Prefill is token-at-a-time (no batched prompt processing — Phase 7).
+- Long-context decode (ctx ≥ ~1–2k) degrades vs llama.cpp (the f32 attention core — Phase 6.6 finding, §9.5 of the report); batched prefill ships, decode-side attention vectorization is the ranked P0.
 
 ## License & attribution
 

@@ -2,7 +2,7 @@
 # =============================================================
 # Phase 6.5 prefill benchmark: batch-size sweep vs llama-bench.
 #
-# For every model: llama.rs prefill tok/s at M in {1, 8, 32, 128, 512}
+# For every model: llama.rs prefill tok/s at M in {1, 8, 16, 32, 64, 128, 256, 512} (Phase 6.6: finer sweep)
 # (LLAMA_RS_PREFILL_M; the prompt is processed in chunks of M) against
 # llama-bench at the same prompt length. Prompts are synthesized to be
 # >= 512 tokens so every batch size actually applies; the M=1 column is
@@ -34,7 +34,7 @@ pp_series() { # model -> prefill tok/s series (one per rep) at current LLAMA_RS_
 }
 
 echo "prefill sweep: reps=$REPS threads=$THREADS ctx=$CTX (prompt ~550 tok; llama.rs medians [P10 P90] vs llama-bench mean)"
-for m in "$LFM" "$QWEN"; do
+for m in ${MODELS:-"$LFM" "$QWEN"}; do
     name=$(basename "$m" .gguf)
     # matched prompt length for llama-bench (exact token count per model tokenizer)
     n_pp=$("$LLAMA_RS" -m "$m" --mode tokenize --no-bos -p "$PROMPT" -t 1 2>/dev/null | grep -oE 'tokens\([0-9]+\)' | grep -oE '[0-9]+')
@@ -42,7 +42,7 @@ for m in "$LFM" "$QWEN"; do
         awk -F'|' -v tag="pp${n_pp:-512} " '$0 ~ tag {gsub(/ /,"",$8); n=split($8,a,"±"); print a[1]}' | head -1)
     cpp=${cpp:-0}
     echo "-- $name (llama.cpp b12502 pp = ${cpp} tok/s, prompt ${n_pp} tokens)"
-    for M in 1 8 32 128 512; do
+    for M in 1 8 16 32 64 128 256 512; do
         s=$(LLAMA_RS_PREFILL_M=$M pp_series "$m")
         read -r med p10 p90 <<< "$(printf '%s\n' $s | python3 "$ROOT/scripts/stats.py")"
         ratio=$(python3 -c "print(f'{100*float(\"${med:-0}\")/float(\"${cpp:-1}\"):.0f}')")

@@ -223,17 +223,21 @@ fn generate_stop(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize, t
 fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize, f32, usize, f32) {
     // prefill, timed separately (includes first-touch page warmup of the
     // weights; across N process repetitions the median absorbs the cold rep).
-    // LLAMA_RS_PROF_PP=1 profiles the prefill phase (op table + kstats).
+    // LLAMA_RS_PROF_PP=1 profiles the prefill phase (op table + kstats);
+    // Phase 6.6: the prefill wall feeds the profiler's phase ticks so the
+    // %wall column is correct for the prefill table too.
     let prof_pp = std::env::var("LLAMA_RS_PROF_PP").is_ok();
     if prof_pp {
         prof::reset();
         llama_kernels::kstats::reset();
     }
     let tp0 = std::time::Instant::now();
+    let pp_tsc0 = prof::decode_begin();
     let mut logits = prefill_model(model, ids);
     let pp_secs = tp0.elapsed().as_secs_f32();
     let pp_tok = ids.len();
     if prof_pp {
+        prof::decode_end(pp_tsc0, pp_tok as u64);
         eprintln!("--- prefill profile ({} tokens) ---", pp_tok);
         print_kstats_summary(pp_tok);
         print!("{}", prof::report());

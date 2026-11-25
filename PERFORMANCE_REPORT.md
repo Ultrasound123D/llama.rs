@@ -1,7 +1,7 @@
-# llama.rs — Phase 6 Performance Engineering Report (rev 5)
+# llama.rs — Phase 6 Performance Engineering Report (rev 6)
 
-**Scope:** profiling infrastructure, scheduling experiments, the AVX-512 VNNI INT8 packed backend (rev 2–3, incl. the C-golden verification campaign), the K-quant packed path (rev 4 / Phase 6.4, first decode above llama.cpp) and — **rev 5 (Phase 6.5) — batched prefill**: an M>1 packed GEMM for all four repacked types, batched LFM3/llama-family forward passes (causal + SWA attention, shortconv window, reusable activation arenas), the Qwen `ffn_down` dispatch-hole fix, and a memory reclaim that halves peak RSS. Qwen prefill reaches **102 % of llama.cpp** (30-rep median, P10/P90 reported).
-**Machine:** 2 vCPU Xeon (Sapphire Rapids class) @ 3.2 GHz KVM guest, AVX-512 + AVX512-VNNI + AMX INT8/BF16 (OS-enabled, XCR0 bits 17/18 verified), 504 MB L3, DRAM ceiling ≈ 14–16 GB/s sustained at 2 threads for one linear stream.
+**Scope:** profiling infrastructure, scheduling experiments, the AVX-512 VNNI INT8 packed backend (rev 2–3, incl. the C-golden verification campaign), the K-quant packed path (rev 4 / Phase 6.4, first decode above llama.cpp), batched prefill (rev 5 / Phase 6.5 — an M>1 packed GEMM for all four repacked types, batched LFM3/llama-family forward passes, the Qwen `ffn_down` dispatch-hole fix, and the memory reclaim that halves peak RSS), and — **rev 6 (Phase 6.6) — the Decode & Kernel Bottleneck Audit**: per-stage decode/prefill profiles for both models, the DRAM ceiling and achieved-bandwidth accounting, CPU-counter availability probes, batch-size and context-length sweeps, and the root-cause classification of every remaining gap. **No code-generation kernels were changed in Phase 6.6 — it is instrumentation and measurement only**; all conclusions below come from the audit's fresh numbers.
+**Machine:** 2 vCPU Xeon (Sapphire Rapids class) @ 3.2 GHz KVM guest, AVX-512 + AVX512-VNNI + AMX INT8/BF16 (OS-enabled, XCR0 bits 17/18 verified), 504 MB L3; DRAM measured ceilings (rev 6, `examples/drambw`): single linear stream **13.9–14.1 GB/s**, two streams **17.2–27.3 GB/s** (shared-host drift visible across passes).
 **Baseline at phase start (rev-1 measurements):** LFM3-1.7B 8.5–8.9 tok/s · Qwen2.5-0.5B 9.2–9.5 tok/s (llama.cpp b12502 references: 10.7–12.0 and 29.4–30.0 decode).
 **No HTTP/server work was done — inference performance only, per the phase contract.**
 
@@ -44,6 +44,19 @@ The Phase 6.4 review verdict was: batched prefill is the next lever (pp 14 %/16 
 4. **Memory reclaim** (§8): `MADV_DONTNEED` (raw-syscall, no libc) on each repacked tensor's original bytes, issued immediately after its repack — LFM3 peak 2050 → 1227 MB, Qwen steady 1079 → 706 MB (724 peak).
 5. **Pool hardening**: the single-flight job-slot protocol is now serialized by a dispatch mutex — concurrent `par_chunks2` calls from parallel test threads previously corrupted results (caught by the new GEMM tests).
 6. **Campaign upgrades**: 30-rep campaign with median/P10/P90 (`scripts/stats.py`), the M-sweep table (§4.2), `--mode mem` / `--mode batchcmp`, parity extended to **24/24** (batched-vs-token top-1, batchcmp logits self-check).
+
+---
+
+## Revision note (rev 6, 2026-11-26) — Phase 6.6: Decode & Kernel Bottleneck Audit
+
+The Phase 6.5 review direction: do not open new kernels yet; make the next phase profiling-driven and classify every remaining gap as kernel / memory / scheduling / instruction-throughput with evidence. Executed as instrumentation only (no compute kernel was touched):
+
+1. **Stage-level profiling completed.** The op profiler now attributes: (a) the prefill phase's own wall (the `%wall` column is correct for prefill tables too), (b) per-stage batch buckets — `elementwise(batch)`, `swiglu(batch)`, `rope_prep(batch)` / `attn_prep(qknorm+rope)(batch)`, `conv_core(batch)`, and `act_quantize(batch)` timed separately from the GEMMs, (c) a machine-readable TSV mode (`LLAMA_RS_PROF_TSV=1`) that `scripts/audit.sh` parses into the stage tables of §9. A real attribution bug was fixed in `pgemm_shared`: the old single shared timer double-counted the q/k/v GEMM triple (each row counted its predecessors' elapsed time); per-tensor timing is now correct, which also corrects §8.1's "GEMM ≈ 80 % of prefill" to the accurate **63 %** (§9.5).
+2. **CPU counters: re-verified blocked.** `examples/perfcheck` calls `perf_event_open` for cycles/instructions/cache-references/cache-misses/branch-misses plus one software event, through the same raw-syscall style as the MADV reclaim, trying six attr sizes: **every event returns EACCES** (rev 1–2 observed EPERM via earlier probes; the precise errno on this guest is EACCES — no hardware counters, no cache-miss counts; TSC + bandwidth arithmetic remain the instrumentation, §1.2 unchanged).
+3. **DRAM ceiling measured, not assumed** (`examples/drambw`: 1 GiB, 4-accumulator u64 fold, 3 passes): single-stream steady **13.9–14.1 GB/s**; two streams **27.3 / 27.3 / 17.2 GB/s** across passes — the shared host interferes (the same drift that moves llama-bench ±5 % between sessions); the honest sustained two-stream figure is **17–27 GB/s**.
+4. **The audit's fresh engine numbers** (5-rep medians, no-regression gate): LFM3 pp 52.90 [51.59 54.01] (60 %), tg 10.99 [10.90 11.69] (**104 %**); Qwen pp 152.67 [151.18 153.81] (**101 %**), tg 22.23 then 23.28 [21.91 23.95] across two campaigns (**77–85 %** — llama.cpp's own tg moved 28.96 → 27.53 in the same window; host noise, both engines drift). Parity **24/24** re-run; 38 workspace tests green, 0 failures.
+5. **Headline findings** (full tables and the classification matrix in §9): decode of both models is **kernel-limited, not memory-limited** (LFM3 streams 12.16 GB/s where llama.cpp streams 12.0 — equal, ~88 % of the single-stream ceiling; the gap to the ceiling is VNNI unpack work, and llama.cpp sits at the same effective rate — which is *why* LFM3 decode holds 101–104 %); Qwen's remaining 19 % is concentrated in the small-tensor attention projections (3.29 GB/s stage = dispatch-bound) and `ffn_down` (8.6 GB/s); prefill of both models is **instruction-throughput bound** (GEMM at 0.65 GB/s ≪ ceiling — shuffle port + AVX-512 frequency licensing), with a *new* dominant term discovered: the batched attention core is **54.3 % of Qwen prefill** and 24.9 % of LFM3's; and the **context sweep found a decode collapse** (Qwen 28 % of llama.cpp at ctx 4050; LFM3 50 % at ctx 4125) that the standard short-prompt campaigns never see — profiled cause: the per-key f32 attention loop (`attn_core`) balloons to **72.7 % / 64.0 % of decode wall** at ctx ≈ 4k while llama.cpp stays flat.
+6. **Gates**: no kernel or numerics code changed (the diff is timers, buckets, two probe examples, four scripts); parity 24/24; workspace tests green; the no-regression campaigns above.
 
 ## Revision note (rev 2, 2026-11-25) — what changed after review
 
@@ -220,9 +233,9 @@ The reclaim (see §8) drops steady-state RSS from ~2× model (packed copy + orig
 
 1. **C-golden differential sweep: ALL GATES GREEN** (rev 4 re-run, `vnni_golden` example) — **153 cases × 8 paths** (Q8_0/Q5_0/Q4_K/Q6_K) vs llama.cpp's transcribed kernels; quantizers byte-exact (q8_0 runtime contract + q8_K single contract); worst path error 1.15e-7 of term energy; mutation sensitivity 7276× (q8_0), 5115× (q4_k), 3376× (q6_k); dispatch gates (cpuinfo cross-check, gated repack → None).
 2. **Parity suite: 16/16 (rev 3/4) → 24/24 (rev 5)** — tokenizer ids 10/10, top-1 greedy after prefill 4/4 (now exercising the BATCHED path), C-reference dequantization 2/2 (Q5_0, Q6_K; max diff 5e-10), + 8 Phase 6.5 gates: batched-vs-token-at-a-time top-1 equality ×4 and the batchcmp logits self-check ×4 (both models, two prompts).
-3. **Workspace tests: 39 passing** (rev 5: + GEMM-vs-matvec differential suites — four types, M sweep, 1t/2t, fused pair, zero cases — and the batched f32 SIMD helper suite; the GEMM tests are the exact-identity link that extends the C-golden chain of §3.4 to M>1).
+3. **Workspace tests: 38 passing at the Phase 6.6 final state** (rev 5 quoted 39 — the earlier figure counted one additional example/doc pass; the test files themselves are untouched by the Phase 6.6 diff, and every suite is green, 0 failures). Rev 5 additions: GEMM-vs-matvec differential suites — four types, M sweep, 1t/2t, fused pair, zero cases — and the batched f32 SIMD helper suite; the GEMM tests are the exact-identity link that extends the C-golden chain of §3.4 to M>1.
 4. **Multiple repetitions:** 5-rep benchmark campaign with medians and all runs listed; 5-rep same-binary A/B; kernel benches 15 reps; llama-bench 5 internal reps.
-5. **No regression hidden by averaging:** every change gated on the parity suite; A/B comparisons through the same binary (`LLAMA_RS_VNNI`, `LLAMA_RS_SLOT`, `LLAMA_RS_SPLIT`).
+5. **No regression hidden by averaging:** every change gated on the parity suite; A/B comparisons through the same binary (`LLAMA_RS_VNNI`, `LLAMA_RS_SLOT`, `LLAMA_RS_SPLIT`). Phase 6.6 re-ran the no-regression gate at the final state (rev-6 note item 4) with 5-rep campaigns per model.
 6. Failed experiments are documented in §2.1/§2.2 rather than silently dropped.
 
 ### 5.1 Unsafe-code / atomics audit summary (the 017145d diff)
@@ -239,17 +252,25 @@ The reclaim (see §8) drops steady-state RSS from ~2× model (packed copy + orig
 ```bash
 cd llama.rs
 cargo build --release
-cargo test --release --workspace          # 28 tests incl. the 10 VNNI (randomized + edge) tests
+cargo test --release --workspace          # 38 tests incl. the VNNI (randomized + edge) tests
 cargo run --release --example vnni_golden  # rev 3: 72-case C-golden differential sweep + dispatch gates + mutation self-test
-bash tests/parity/run_parity.sh          # 16/16 vs llama.cpp
+bash tests/parity/run_parity.sh          # 24/24 vs llama.cpp
 bash scripts/bench_decode.sh 30           # pp+tg matched campaign vs llama-bench (median [P10 P90])
-bash scripts/bench_prefill.sh 3          # Phase 6.5: M sweep {1,8,32,128,512} vs llama-bench
+bash scripts/bench_prefill.sh 3           # M sweep {1,8,16,32,64,128,256,512} vs llama-bench (rev 6: finer)
+bash scripts/audit.sh 3                    # Phase 6.6: stage tables + DRAM ceiling + perf probe (§9)
+MODELS=<model> bash scripts/bench_ctx.sh  # Phase 6.6: decode vs context length (§9.5)
+cargo run --release --example perfcheck --manifest-path crates/llama-kernels/Cargo.toml  # CPU-counter probe
+cargo run --release --example drambw   --manifest-path crates/llama-kernels/Cargo.toml  # DRAM ceiling
 LLAMA_RS_VNNI=0 bash scripts/bench_decode.sh 5   # A/B: AVX2 fallback, same binary
 bash scripts/profile_decode.sh            # per-op tables + kernel micro-bench
 LLAMA_RS_PROF=1 ./target/release/llama-rs-cli -m <model> --mode bench -p "The capital of France is" -n 48 -t 2
+LLAMA_RS_PROF=1 LLAMA_RS_PROF_TSV=1 LLAMA_RS_PROF_PP=1 LLAMA_RS_PREFILL_M=128 \
+  ./target/release/llama-rs-cli -m <model> --mode bench -p "<long prompt>" -n 4   # prefill TSV profile
 ```
 
-## 7. Next steps (re-ranked after Phase 6.5)
+## 7. Next steps (re-ranked after Phase 6.5 — superseded by the Phase 6.6 evidence-based ranking in §9.8)
+
+The Phase 6.6 audit re-ranked these with measurements (§9.8): attention-core vectorization is now the P0 (54 % of Qwen prefill, 72 % of long-ctx decode); GEMM register-blocking and per-layer grouped dispatch are P1; the AMX tile backend and AVX2 fallback benchmarking are P2. The list below is kept for the record:
 
 1. **Batched prefill (M>1) — DONE in Phase 6.5** (§8): LFM3 pp 14 % → 62 %, Qwen pp 16 % → **102 %** (30-rep medians). Remaining prefill gap (LFM3 at pp512, Qwen 46–53 % at M≥128) is the GEMM kernel's shuffle-bound ~17 % VNNI efficiency vs llama.cpp's AMX tiles (§8.1).
 2. **GEMM kernel restructure** — register-blocked multi-token inner loop (2–4 rows per tile load, pre-broadcast activation layouts to dodge the shuffle port): the measured path from 42 %/53 % at M=128 toward the AMX-tile throughput. The capability groundwork (CPUID/XCR0 tile detection) is validated since Phase 6.3 — a real AMX tile backend (LDTILECFG/TDPBUSD) is the alternative route and is also what llama.cpp actually runs here.
@@ -285,3 +306,101 @@ bash scripts/bench_decode.sh 30        # 30-rep campaign with median/P10/P90 (§
 LLAMA_RS_MEM_KEEP=1 ... --mode mem     # A/B: keep originals (2× footprint)
 LLAMA_RS_PREFILL_M=1 ... --mode bench  # A/B: token-at-a-time prefill
 ```
+
+---
+
+## 9. Phase 6.6 — Decode & Kernel Bottleneck Audit (the evidence section)
+
+Method: `scripts/audit.sh` runs, per model, 3 decode-profile process reps (48-token decode, TSV op tables) and 3 prefill-profile reps (~550-token prompt, M=128), medians per bucket; `scripts/audit_parse.py` aggregates tensor-class rows into the stage tables below. Bandwidth classification uses the measured ceilings (§ rev 6 item 3) and the profiler's per-bucket byte attribution (weight bytes actually streamed per call). Evidence files: `audit/*.tsv` (gitignored, regenerated by the script).
+
+### 9.1 CPU counters and the measurement method (the constraint, stated)
+
+`perf_event_open` returns **EACCES for every hardware and software event** on this guest (`examples/perfcheck`, six attr sizes tried). There are no cycle, instruction or cache-miss counters: all timing is the invariant TSC, all "cache behavior" is effective-bandwidth arithmetic (bytes the profiler attributes / elapsed), and the DRAM ceiling comes from `examples/drambw`. Single-linear-stream ceiling: **13.9–14.1 GB/s**; two streams (the decode configuration): **17.2–27.3 GB/s** across passes — the shared host's interference is visible (pass 3 of a 3-pass run drops to 17.2), and the same drift moves llama-bench ±5 % between sessions. Every ratio below is quoted against numbers measured in the same session.
+
+### 9.2 LFM3 decode (101–104 % of llama.cpp) — at the machine's effective rate
+
+| stage | µs/tok | %wall | MB/tok | stream GB/s |
+|---|---:|---:|---:|---:|
+| ffn gate+up (fused pair, Q4_K) | 25 972 | 29.7 % | 424.7 | 15.97 |
+| ffn_down (Q4_K/Q6_K mix) | 22 908 | 26.2 % | 261.0 | 11.13 |
+| output head (tied embd, Q6_K) | 15 530 | 17.7 % | 215.0 | 13.52 |
+| conv in/out_proj (Q4_K) | 10 249 | 11.7 % | 122.7 | 11.69 |
+| attn projections (q/k/v/o/gate) | 7 290 | 8.3 % | 66.4 | 8.90 |
+| everything else (attn core 0.8 %, norms, rope, conv, glue) | ~5 500 | 6.4 % | — | — |
+| **total** | **87 560** | 100 % | **1 090 MB** | **12.16 overall** |
+
+llama.cpp on the same workload streams the same 1 090 MB/token at 11.00 tok/s = **12.0 GB/s — the same effective rate**. Both engines sit at ~88 % of the single-stream linear ceiling; the residual is the VNNI unpack compute (dpbusd + nibble/table unpack + per-group scale work) that no engine here can skip — which is *why* the engines are equal and why LFM3 decode holds 101–104 %. **Classification: at the pattern-effective machine limit; parity, not a gap.** (The 2-stream burst ceiling of 27 GB/s is unreachable by a 1090 MB/token working set interleaved with unpack work — the pure-fold probe has no compute in its stream.)
+
+### 9.3 Qwen decode (77–85 %) — where the remaining ~19 % actually goes
+
+| stage | µs/tok | %wall | MB/tok | stream GB/s |
+|---|---:|---:|---:|---:|
+| ffn gate+up (Q5_0 pair) | 12 704 | 31.8 % | 143.8 | 11.06 |
+| output head (tied embd) | 7 429 | 18.6 % | 144.6 | 19.01 |
+| ffn_down (Q4_K/Q6_K mix) | 8 192 | 20.5 % | 72.3 | 8.62 |
+| attn projections (q/k/v/o) | 9 137 | 22.9 % | 30.8 | **3.29** |
+| everything else (attn 1.3 %, rope, norms, glue) | ~2 100 | 5.4 % | — | — |
+| **total** | **39 890** | 100 % | **392 MB** | **9.59 overall** |
+
+llama.cpp streams the same 392 MB/token at 27.5–29.4 tok/s = **12.8–13.0 GB/s**. The 19 % engine gap decomposes into exactly two measured terms:
+
+1. **The attention-projection stage: 30.8 MB of small tensors (q/k/v/o per layer, 169 matvecs/token) take 9.14 ms — 3.29 GB/s.** At the stage rates the big tensors achieve (11–19 GB/s) this traffic should cost ~2.2 ms; the extra ~7 ms/token is the per-matvec band-split dispatch and thread hand-off on small work units — llama.cpp runs these inside one fused graph pass. This is a **scheduling** term (the pool itself is clean: kstats show 0 µs enqueue/wait, 0 parks) — the cost is the *granularity* of the dispatch, not the mechanism.
+2. **ffn_down streams at 8.62 GB/s** (Q4_K/Q6_K packed kernels) vs the 12.8 GB/s llama.cpp achieves in aggregate — a **kernel** term worth ~1.5 ms/token.
+
+Fixing both (grouped per-layer dispatch + faster ffn_down) would put Qwen decode at 392 MB / (29.4 tok/s ≈ 34 ms) ≈ llama.cpp's own effective rate — i.e. the same "at the machine limit" state LFM3 decode already enjoys. **Classification: mixed scheduling + kernel; not memory.**
+
+### 9.4 Prefill stage splits (M=128, ~550-token prompt)
+
+**LFM3 prefill (42–43 % of llama.cpp at this length):**
+
+| stage | µs/tok | %wall | stream GB/s |
+|---|---:|---:|---:|
+| GEMM (gate+up 30.1 % + ffn_down 19.9 % + conv 8.8 % + attn 4.5 %) | 14 678 | **63.3 %** | **0.65 in-GEMM** |
+| attention core (batch, SWA+full, f32) | 5 786 | 24.9 % | — |
+| norms/residual/swiglu | 1 246 | 5.4 % | — |
+| activation quantize | 599 | 2.6 % | 2.23 |
+| conv window+state | 290 | 1.3 % | — |
+| rope/qknorm, head, glue, residual | ~600 | 2.6 % | — |
+| **total** | **23 210** | 100 % | (11 MB/token streamed) |
+
+**Qwen prefill (53 % at this length):** attention core (batch) **54.3 %** (6 444 µs/tok), GEMMs 32.4 % at 0.90 GB/s in-GEMM, quantize 4.8 %, elementwise 5.7 %, wall 11.87 ms/token.
+
+**Classification for both: instruction-throughput bound, not memory.** The GEMMs stream 0.65–0.90 GB/s — 5 % of the ceiling — because the operand-broadcast structure of `dpbusd` needs a `vpermd` per instruction (the single shuffle port caps the issue rate at ~50 %, §8.1) compounded by the documented AVX-512 frequency licensing. The attention term is O(M·L) f32 compute; at M=128 with L≈550 it is already 54 % of Qwen prefill — llama.cpp's flash-style fused kernels and AMX tiles are what the remaining gap is made of. (Note: §8.1's "GEMM ≈ 80 % of prefill" was the old shared-timer attribution; the corrected per-tensor split is 63 %.)
+
+### 9.5 Context sweep — the decode collapse the short-prompt campaigns never see
+
+llama.rs tg (32 tokens) after prefilling the matched prompt length; llama-bench same session, 1 rep per point (trend evidence — the campaign medians are §4.1's):
+
+| ctx (tok) | LFM3 rs / cpp / ratio | Qwen rs / cpp / ratio |
+|---:|---|---|
+| ~110 | 11.41 / 10.91 / **105 %** | 21.24 / 27.36 / 78 % |
+| ~275 | 10.75 / 10.99 / 98 % | 21.39 / 26.88 / 80 % |
+| ~1035 | 9.16 / 10.89 / 84 % | 17.57 / 28.47 / 62 % |
+| ~2070 | 7.54 / 10.36 / 73 % | 13.88 / 29.38 / 47 % |
+| ~4080 | 5.49 / 10.94 / **50 %** | 7.89 / 28.19 / **28 %** |
+
+**llama.cpp's decode is context-flat; ours collapses.** Profiled cause (one run each at ctx ≈ 4k): `attn_core` balloons to **72.7 % of Qwen decode wall (91.6 ms/token)** and **64.0 % of LFM3's (120 ms/token)**. The per-key loop (`scores.push(dot(q,k)); softmax; axpy per key`) is O(ctx) with a per-key Vec push and scalar accumulation — a kernel problem, not memory: at ctx 4k the KV read traffic is ~2–3 MB/token (trivial); it is pure f32 loop inefficiency versus llama.cpp's vectorized flash-style kernels. **Classification: kernel (attention core); this is the largest single measured gap in the whole audit and it was invisible to the headline campaigns.**
+
+### 9.6 Batch-size sweep (finer, 8 points, 2 reps, ~550-token prompts)
+
+LFM3: M=1 11.01 (11 %) · 8 30.41 (30 %) · 16 35.78 (36 %) · 32 39.98 (40 %) · 64 42.13 (42 %) · 128 42.38 (42 %) · **256 42.61 (43 %)** · 512 40.05 (40 %) — llama.cpp 100.08. Qwen: 21.11 (13 %) · 59.09 (37 %) · 70.72 (44 %) · 80.03 (50 %) · **64 84.62 (53 %) · 128 84.70 (53 %)** · 256 82.27 (51 %) · 512 73.22 (46 %) — llama.cpp 160.62. The sweet spots (M=256 LFM3 / M=128 Qwen) and the M=512 attention-overtake are confirmed at finer resolution; nothing new changes the §4.2 reading.
+
+### 9.7 Root-cause classification matrix (the Phase 6.6 deliverable)
+
+| Workload (short-ctx campaigns) | ratio vs llama.cpp | binding constraint — measured evidence | classification |
+|---|---|---|---|
+| LFM3 decode | 101–104 % | 12.16 GB/s effective = llama.cpp's 12.0; both ≈ 88 % of single-stream ceiling | **at the pattern-effective machine limit — parity** |
+| Qwen decode | 77–85 % | attn-proj stage 3.29 GB/s (7 ms/token over ideal) + ffn_down 8.6 GB/s | **scheduling (dispatch granularity) + kernel (ffn_down rates); not memory** |
+| LFM3 prefill @550 | 42–43 % | GEMM 63 % of wall at 0.65 GB/s ≪ ceiling | **instruction throughput (shuffle port + AVX-512 licensing)** |
+| Qwen prefill @540 | 53 % | attention core 54 % of wall (O(M·L) f32) | **kernel (batched attention core)** |
+| Memory (all workloads) | — | decode 9.6–12.2 GB/s < 14 ceiling; prefill 0.4–0.9 GB/s | **never the binding constraint** |
+| Scheduling (decode) | — | pool enqueue/wait ≈ 0 µs, 0 parks; cost only via per-matvec band-split × 169/token | **clean at macro scale; granularity is the term** |
+| Long-context decode (§9.5) | 28–50 % at ctx 4k | attn_core 72.7 %/64.0 % of wall; llama.cpp flat | **kernel (per-key f32 attention loop)** |
+
+### 9.8 Re-ranked next steps (evidence-weighted, per the review's priority table)
+
+1. **P0 — batched + decode attention core vectorization** (new evidence, largest measured term): flash-style row blocking, SIMD dot/softmax/axpy over key runs, f32 first. §9.4 (54 % of Qwen prefill) and §9.5 (72 % of long-ctx decode) are both this one kernel family; nothing else in the audit is this large. An f16 KV cache halves the traffic on top.
+2. **P1 — GEMM register-blocking / shuffle-dodging layouts** (2–4 rows per tile load, pre-broadcast activation layouts): the measured path from 42 %/53 % toward the AMX-tile throughput; §8.1's analysis stands.
+3. **P1 — per-layer grouped matvec dispatch** (q/k/v/o in one band-split per layer): removes the Qwen attn-proj 7 ms/token dispatch term; pairs with `ffn_down` kernel work to close Qwen decode to parity.
+4. **P2 — a real AMX tile backend** (LDTILECFG/TDPBUSD; CPUID/XCR0 tile detection validated since Phase 6.3): llama.cpp's actual M>1 path on this machine.
+5. **P2 — AVX2 fallback benchmarking** (independent numbers, not just parity) and the file-backed lazy loader (§7 item 4, memory).
