@@ -2,6 +2,8 @@
 
 A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage**, output-compatible with llama.cpp — proven by automated parity tests (24/24 passing).
 
+**Releases:** [v0.1.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.1.0) (engine complete, parity 16/16) → [v0.2.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.2.0) (SIMD kernels, Qwen decode ~2.5×) → [v0.3.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.3.0) (packed VNNI + batched prefill — at/above llama.cpp on two axes; linux-x64 binary attached). Release notes carry the measured evidence for each milestone.
+
 ## Status (v0.3 — Phases 0–6.6 complete)
 
 | Feature | Status | Evidence |
