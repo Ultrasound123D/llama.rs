@@ -1,6 +1,6 @@
 # LLAMA_RS_ARCHITECTURE — Architecture Document for the llama.rs Engine (a Native Rust Port of the llama.cpp Engine)
 
-**Version:** 0.2 (Phases 0–6) · **Date:** 2026-11-25 (Phase 6)
+**Version:** 0.2.1 (Phases 0–6.5) · **Date:** 2026-11-26 (Phase 6.5)
 **Source baseline:** llama.cpp b12502 (commit 398f00d65) — fully cloned and audited locally
 **Goal:** a native GGUF inference engine written in Rust, output-compatible with llama.cpp (parity proven by tests), with zero C/C++ runtime linkage.
 
@@ -131,6 +131,16 @@ Measurements on this VM (2 vCPU Xeon sapphirerapids, 3200 MHz, DRAM ceiling 29 G
 - Q4_K 2048×524288 (1 GB): 9.0 → **13.9 GB/s** after adding software prefetch (the single biggest win, +53%); Q6_K: 16.8 GB/s; Q8_0: 1.6 → 6.7 GB/s after inlining the 256-bit VNNI dot.
 - Full LFM3-1.7B: 0.9 → **8.7 tok/s** (llama.cpp 11.9, which loads an AVX-512 + AMX backend).
 - AVX-512 VNNI q4_K kernel: built and tested (`avx512.rs`, comparison in `examples/q4cmp.rs`) but ~9% slower than AVX2 on this VM → default dispatch stays AVX2.
+
+
+### Phase 6.5 addendum (batched prefill + memory reclaim)
+
+- **Packed GEMM (M>1)** — `llama-kernels/src/vnni.rs::gemm_prepared/gemm2_prepared`: the M×K row-major activation matrix is quantized once per weight type (`quantize_batch`; one row per token, the exact M=1 quantizer contract), then each 16-column packed group streams against all rows (tiles stay L1/L2-resident across the row loop; DRAM traffic per weight byte = once per **batch** instead of once per token). Each output column is **bit-identical to `matvec_vnni`** for that row — the exact-identity link that extends the C-golden verification of §5 to M>1. Q4_K/Q6_K/Q8_0/Q5_0 all covered.
+- **Batched forward** — `llama-core` `Lfm3::forward_batch` / `LlamaFamily::forward_batch` + `prefill()` chunker (`LLAMA_RS_PREFILL_M`, default 512): causal attention with per-query key ranges (SWA window for LFM3), the shortconv causal window over `[state | M new values]`, q/k norm + rope per row, qwen biases, head gates, fused gate/up GEMM pair, reusable activation arenas (`Lfm3Batch` / `LlamaBatch` — one allocation, rows reused). M=1 routes through the untouched decode `forward`.
+- **Attention core (batched)** — `llama-kernels/src/batch.rs`: AVX2 f32 dot, SIMD softmax (the ggml `exp_ps` 2^k structure), FMA value accumulation; the decode path keeps its scalar f64-stable softmax.
+- **Memory reclaim** — `llama-gguf::GgufFile::free_tensor_pages` (raw-syscall `MADV_DONTNEED`, no libc): each repacked tensor's original pages are released immediately after its repack; safe because the packed map is then the only reader path (fallbacks run only for tensors never freed). Peak RSS: LFM3 2050 → 1227 MB, Qwen 1079 → 706 MB steady (724 peak). `LLAMA_RS_MEM_KEEP=1` for A/B.
+- **Pool hardening** — `pool.rs::DISPATCH_MUX`: the single-flight slot protocol is serialized across driver threads (concurrent test-thread dispatches previously corrupted results).
+- **Qwen ffn_down fix** — the llama-family decode `ffn_down` ran the AVX2 matvec (the last uncovered matmul of Phase 6.4's audit); now routed through the packed `pmv` dispatch.
 
 ### Phase 6.1–6.3 addendum (performance engineering session)
 

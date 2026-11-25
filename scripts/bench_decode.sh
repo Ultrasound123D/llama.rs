@@ -37,6 +37,9 @@ bench_rs() { # model -> "pp1 pp2 ...|tg1 tg2 ..." (one series per phase)
 median_of() { # space-separated numbers -> median
     printf '%s\n' $1 | sort -n | awk '{a[NR]=$1} END {print (NR%2==1)? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}'
 }
+stats_of() { # space-separated numbers -> "median P10 P90" (Phase 6.5: percentile reporting)
+    printf '%s\n' $1 | python3 "$ROOT/scripts/stats.py"
+}
 
 bench_cpp_both() { # model n_pp -> "pp tg" (llama-bench mean over its internal reps)
     local out pp tg
@@ -59,8 +62,12 @@ for m in "$LFM" "$QWEN"; do
     read -r cpp_pp cpp_tg <<< "$(bench_cpp_both "$m" "${n_pp:-54}")"
     pp_ratio=$(python3 -c "print(f'{100*float(\"${rs_pp:-0}\")/float(\"${cpp_pp:-1}\"):.0f}')")
     tg_ratio=$(python3 -c "print(f'{100*float(\"${rs_tg:-0}\")/float(\"${cpp_tg:-1}\"):.0f}')")
-    printf '%-34s pp: llama.rs %6.2f | llama.cpp %6.2f tok/s | %5s%%\n' "$name" "$rs_pp" "$cpp_pp" "$pp_ratio"
-    printf '%-34s tg: llama.rs %6.2f | llama.cpp %6.2f tok/s | %5s%%\n' "$name" "$rs_tg" "$cpp_tg" "$tg_ratio"
+    read -r pp_med pp_p10 pp_p90 <<< "$(stats_of "${series%%|*}")"
+    read -r tg_med tg_p10 tg_p90 <<< "$(stats_of "${series##*|}")"
+    pp_ratio=$(python3 -c "print(f'{100*float("${pp_med:-0}")/float("${cpp_pp:-1}"):.0f}')")
+    tg_ratio=$(python3 -c "print(f'{100*float("${tg_med:-0}")/float("${cpp_tg:-1}"):.0f}')")
+    printf '%-34s pp: llama.rs %6.2f [P10 %6.2f P90 %6.2f] | llama.cpp %6.2f tok/s | %5s%%\n' "$name" "$pp_med" "$pp_p10" "$pp_p90" "$cpp_pp" "$pp_ratio"
+    printf '%-34s tg: llama.rs %6.2f [P10 %6.2f P90 %6.2f] | llama.cpp %6.2f tok/s | %5s%%\n' "$name" "$tg_med" "$tg_p10" "$tg_p90" "$cpp_tg" "$tg_ratio"
     echo "  pp runs: ${series%%|*}"
     echo "  tg runs: ${series##*|}"
 done

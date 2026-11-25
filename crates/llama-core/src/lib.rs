@@ -105,6 +105,35 @@ pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     out
 }
 
+/// RMSNorm into a caller buffer (Phase 6.5 batched rows; no allocation).
+/// `out` may alias `x` (the mean is fully accumulated before any write).
+pub fn rmsnorm_into(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+    let n = x.len();
+    debug_assert_eq!(out.len(), n);
+    let mut ss = 0f64;
+    for v in x { ss += (*v as f64) * (*v as f64); }
+    let mean = ss / n as f64;
+    let scale = 1.0 / (mean + eps as f64).sqrt();
+    for i in 0..n {
+        out[i] = (x[i] as f64 * scale * (w[i] as f64)) as f32;
+    }
+}
+
+/// RMSNorm in place (Phase 6.5 rows): same formula, no aliasing gymnastics.
+/// (mean fully accumulated before the first write)
+pub fn rmsnorm_inplace(x: &mut [f32], w: &[f32], eps: f32) {
+    let n = x.len();
+    let mut ss = 0f64;
+    for v in x.iter() {
+        ss += (*v as f64) * (*v as f64);
+    }
+    let mean = ss / n as f64;
+    let scale = 1.0 / (mean + eps as f64).sqrt();
+    for i in 0..n {
+        x[i] = (x[i] as f64 * scale * (w[i] as f64)) as f32;
+    }
+}
+
 #[inline]
 pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x as f64).exp()) as f32

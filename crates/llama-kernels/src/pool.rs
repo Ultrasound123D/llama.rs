@@ -48,6 +48,17 @@ struct PoolShared {
 
 static POOL: OnceLock<&'static PoolShared> = OnceLock::new();
 
+/// Dispatch serializer (Phase 6.5): the slot protocol and the `outstanding`
+/// counter are single-flight by construction — two OS threads dispatching
+/// concurrently would overwrite each other's published job. The engine
+/// drives the pool from one thread, but tests (cargo-test runs them in
+/// parallel) and any future multi-driver use must not corrupt results: a
+/// dispatch holds this mutex from publish through wait. Uncontended cost
+/// ~40 ns — noise against the ~µs dispatch. NOT reentrant: closures must
+/// not dispatch back into the pool from the caller thread (workers' calls
+/// are already routed to the sequential fallback below).
+static DISPATCH_MUX: Mutex<()> = Mutex::new(());
+
 /// Spin budgets (tuned on the 2-vCPU sapphirerapids guest @3.2 GHz):
 /// - worker spin: ~150 µs of pause-loop before parking;
 /// - caller spin: ~100 µs of pause-loop before falling back to the condvar.
@@ -249,6 +260,8 @@ pub fn par_chunks2<A: FnOnce(), B: FnMut()>(a: A, mut b: B) {
         b();
         return;
     }
+    // single-flight across ALL driver threads (see DISPATCH_MUX above)
+    let _dispatch_guard = DISPATCH_MUX.lock().unwrap();
     if !slot_enabled() {
         // legacy queue path (same semantics, measurable A/B).
         // Lifetime erasure on the trait-object fat pointer — sound because
@@ -381,6 +394,8 @@ pub fn par_chunks(n_chunks: usize, n_threads: usize, f: &(dyn Fn(usize) + Sync))
         }
         return;
     }
+    // single-flight across all driver threads (same serializer as par_chunks2)
+    let _dispatch_guard = DISPATCH_MUX.lock().unwrap();
     let sh = shared();
     let scoped = ScopedFn { f };
     let prof = kstats::enabled();

@@ -630,3 +630,219 @@ fn vnni_kq_activation_edge_cases() {
         kq_case(GgmlType::Q6_K, &data6, n_in, n_out, x, &format!("Q6_K act edge '{name}'"));
     }
 }
+
+// ---------- Phase 6.5: packed GEMM (M>1 batched prefill) ----------
+
+/// Random activation matrix (M × n_in), values in a safe range.
+fn make_x(m: usize, n_in: usize, seed: u64) -> Vec<f32> {
+    let mut st = seed;
+    (0..m * n_in)
+        .map(|_| {
+            let v = (xr(&mut st) % 4096) as f32 / 512.0 - 4.0;
+            v
+        })
+        .collect()
+}
+
+/// The packed GEMM contract: every output row m of `gemm_prepared` is
+/// BIT-IDENTICAL to running `matvec_vnni` on activation row m alone (same
+/// quantizer, same group-dot accumulation order). Checked exact.
+fn gemm_case(
+    ty: GgmlType,
+    data: &[u8],
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    m: usize,
+    threads: usize,
+    tag: &str,
+) {
+    let packed = match ty {
+        GgmlType::Q8_0 => vnni::repack_q8_0(data, n_in, n_out),
+        GgmlType::Q5_0 => vnni::repack_q5_0(data, n_in, n_out),
+        GgmlType::Q4_K => vnni::repack_q4_k(data, n_in, n_out),
+        GgmlType::Q6_K => vnni::repack_q6_k(data, n_in, n_out),
+        _ => unreachable!(),
+    };
+    let pt = vnni::PackedTensor {
+        data: packed,
+        ty,
+        n_in,
+        n_out,
+    };
+    let q = vnni::quantize_batch(ty, x, n_in, m, threads);
+    let mut out = vec![0f32; m * n_out];
+    vnni::gemm_prepared(&pt, &q, threads, &mut out);
+    // per-row reference: matvec_vnni on the single row
+    let mut ref_row = vec![0f32; n_out];
+    let mut mismatches = 0usize;
+    let mut max_abs = 0f64;
+    for mm in 0..m {
+        let row = &x[mm * n_in..(mm + 1) * n_in];
+        vnni::matvec_vnni(&pt.data, ty, n_in, n_out, row, 1, &mut ref_row);
+        for o in 0..n_out {
+            let a = out[mm * n_out + o];
+            let b = ref_row[o];
+            if a.to_bits() != b.to_bits() {
+                mismatches += 1;
+                max_abs = max_abs.max((a - b).abs() as f64);
+            }
+        }
+    }
+    assert!(
+        mismatches == 0,
+        "{tag}: GEMM vs matvec mismatch ({mismatches} of {} entries, max_abs {max_abs:.3e})",
+        m * n_out
+    );
+    eprintln!("  {tag}: M={m} threads={threads} — bit-identical to matvec_vnni");
+}
+
+#[test]
+fn vnni_gemm_matches_matvec_all_types() {
+    if !vnni::vnni_path_available() {
+        eprintln!("SKIP (no AVX512-VNNI)");
+        return;
+    }
+    // one small + one model-realistic shape per family; M sweep incl. odd
+    // sizes (non-multiples of the tile/quant blocks) and a big batch
+    let shapes: Vec<(&str, GgmlType, usize, usize)> = vec![
+        ("Q8_0 64x32", GgmlType::Q8_0, 64, 32),
+        ("Q8_0 2048x64", GgmlType::Q8_0, 2048, 64),
+        ("Q5_0 64x32", GgmlType::Q5_0, 64, 32),
+        ("Q5_0 896x4864", GgmlType::Q5_0, 896, 4864),
+        ("Q4_K 256x32", GgmlType::Q4_K, 256, 32),
+        ("Q4_K 2048x7680", GgmlType::Q4_K, 2048, 7680),
+        ("Q6_K 256x32", GgmlType::Q6_K, 256, 32),
+        ("Q6_K 7680x2048", GgmlType::Q6_K, 7680, 2048),
+    ];
+    for (name, ty, n_in, n_out) in &shapes {
+        let (data, seed) = match ty {
+            GgmlType::Q8_0 => (make_q8_0(*n_in, *n_out), 0x1111_2222u64),
+            GgmlType::Q5_0 => (make_q5_0(*n_in, *n_out), 0x3333_4444u64),
+            GgmlType::Q4_K => (make_q4_k(*n_in, *n_out, 0x5555_6666u64), 0x5555_6666u64),
+            GgmlType::Q6_K => (make_q6_k(*n_in, *n_out, 0x7777_8888u64), 0x7777_8888u64),
+            _ => unreachable!(),
+        };
+        for m in [1usize, 2, 3, 8, 17, 64] {
+            let x = make_x(m, *n_in, seed.wrapping_add(m as u64));
+            gemm_case(*ty, &data, *n_in, *n_out, &x, m, 1, name);
+            if m >= 3 {
+                // 2-thread band split must produce the identical matrix
+                gemm_case(*ty, &data, *n_in, *n_out, &x, m, 2, name);
+            }
+        }
+    }
+}
+
+#[test]
+fn vnni_gemm_fused_pair_matches_two_gems() {
+    if !vnni::vnni_path_available() {
+        eprintln!("SKIP (no AVX512-VNNI)");
+        return;
+    }
+    let (n_in, n_out1, n_out2, m) = (256usize, 32usize, 48usize, 9usize);
+    let d1 = make_q4_k(n_in, n_out1, 0xaaaa_1010u64);
+    let d2 = make_q4_k(n_in, n_out2, 0xbbbb_2020u64);
+    let x = make_x(m, n_in, 0xcccc_3030u64);
+    let p1 = vnni::PackedTensor {
+        data: vnni::repack_q4_k(&d1, n_in, n_out1),
+        ty: GgmlType::Q4_K,
+        n_in,
+        n_out: n_out1,
+    };
+    let p2 = vnni::PackedTensor {
+        data: vnni::repack_q4_k(&d2, n_in, n_out2),
+        ty: GgmlType::Q4_K,
+        n_in,
+        n_out: n_out2,
+    };
+    let q = vnni::quantize_batch(GgmlType::Q4_K, &x, n_in, m, 2);
+    let mut o1 = vec![0f32; m * n_out1];
+    let mut o2 = vec![0f32; m * n_out2];
+    vnni::gemm2_prepared(&p1, &p2, &q, 2, &mut o1, &mut o2);
+    let mut r1 = vec![0f32; m * n_out1];
+    let mut r2 = vec![0f32; m * n_out2];
+    vnni::gemm_prepared(&p1, &q, 1, &mut r1);
+    vnni::gemm_prepared(&p2, &q, 1, &mut r2);
+    for i in 0..o1.len() {
+        assert_eq!(o1[i].to_bits(), r1[i].to_bits(), "fused pair out1 mismatch @ {i}");
+    }
+    for i in 0..o2.len() {
+        assert_eq!(o2[i].to_bits(), r2[i].to_bits(), "fused pair out2 mismatch @ {i}");
+    }
+    eprintln!("  fused GEMM pair (Q4_K 256 -> 32/48, M=9, 2t): bit-identical to two singles");
+}
+
+#[test]
+fn vnni_gemm_zero_rows_and_zero_weights() {
+    if !vnni::vnni_path_available() {
+        eprintln!("SKIP (no AVX512-VNNI)");
+        return;
+    }
+    let (n_in, n_out, m) = (256usize, 32usize, 5usize);
+    let data = q4_k_uniform(0, 0, 0, 0, n_in, n_out); // all-zero weights
+    let x = make_x(m, n_in, 0x0bad_f00du64);
+    gemm_case(GgmlType::Q4_K, &data, n_in, n_out, &x, m, 1, "Q4_K zero weights");
+    let xz = vec![0f32; m * n_in];
+    let data2 = make_q4_k(n_in, n_out, 0x1234_5678u64);
+    gemm_case(GgmlType::Q4_K, &data2, n_in, n_out, &xz, m, 1, "Q4_K zero activations");
+    // M=0 must be a no-op (does not touch out)
+    let pt = vnni::PackedTensor {
+        data: vnni::repack_q4_k(&data2, n_in, n_out),
+        ty: GgmlType::Q4_K,
+        n_in,
+        n_out,
+    };
+    let q = vnni::quantize_batch(GgmlType::Q4_K, &[], n_in, 0, 1);
+    let mut out = vec![-1f32; 0];
+    vnni::gemm_prepared(&pt, &q, 1, &mut out);
+    assert!(out.is_empty());
+    eprintln!("  zero weights / zero activations / M=0: OK");
+}
+
+// ---------- Phase 6.5: batched f32 SIMD helpers ----------
+
+#[test]
+fn batch_helpers_match_f64_reference() {
+    use llama_kernels::batch;
+    // dot vs f64 sequential reference
+    let mut st = 0x5f3a_b1c2u64;
+    let n = 300usize;
+    let a: Vec<f32> = (0..n).map(|_| (xr(&mut st) % 2048) as f32 / 256.0 - 4.0).collect();
+    let b: Vec<f32> = (0..n).map(|_| (xr(&mut st) % 2048) as f32 / 256.0 - 4.0).collect();
+    let mut refd = 0f64;
+    for i in 0..n {
+        refd += a[i] as f64 * b[i] as f64;
+    }
+    let got = batch::dot_f32(&a, &b);
+    let rel = ((got as f64 - refd) / refd.abs().max(1e-3)).abs();
+    assert!(rel < 1e-5, "dot_f32 rel {rel:.3e}");
+    // softmax vs f64 stable reference
+    let mut scores: Vec<f32> = (0..257).map(|_| (xr(&mut st) % 4096) as f32 / 256.0 - 8.0).collect();
+    let mut c = scores.clone();
+    batch::softmax_inplace_f32(&mut scores);
+    let max = c.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0f64;
+    for v in c.iter_mut() {
+        *v = ((*v - max) as f64).exp() as f32;
+        sum += *v as f64;
+    }
+    for v in c.iter_mut() {
+        *v = (*v as f64 / sum) as f32;
+    }
+    let mut max_rel = 0f64;
+    for (x, y) in scores.iter().zip(c.iter()) {
+        let d = (*x - *y).abs() as f64;
+        let m = x.abs().max(y.abs()).max(1e-6) as f64;
+        max_rel = max_rel.max(d / m);
+    }
+    assert!(max_rel < 1e-5, "softmax rel {max_rel:.3e}");
+    eprintln!("  batch helpers: dot rel {rel:.2e}, softmax rel {max_rel:.2e} (vs f64 reference)");
+    // axpy
+    let v = vec![1.5f32; 128];
+    let mut o = vec![0.25f32; 128];
+    batch::axpy_f32(2.0, &v, &mut o);
+    for x in &o {
+        assert_eq!(*x, 3.25);
+    }
+}

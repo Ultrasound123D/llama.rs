@@ -24,6 +24,8 @@ pub mod pool;
 pub mod quant;
 pub mod scalar;
 pub mod kstats;
+/// Phase 6.5 batched-prefill f32 SIMD helpers (attention core).
+pub mod batch;
 /// AVX-512 VNNI INT8 packed backend (Phase 6.3). NOTE: despite its llama.cpp
 /// lineage ("the AMX backend's M=1 decode route"), this module executes
 /// AVX-512 VNNI instructions only — no AMX tile instructions. See the module

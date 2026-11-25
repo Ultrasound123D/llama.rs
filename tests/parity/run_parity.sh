@@ -71,6 +71,23 @@ for model in "$QWEN" "$LFM"; do
   done
 done
 
+
+echo "== [2b] Phase 6.5 batched prefill: top-1 identical to token-at-a-time + batchcmp self-check =="
+for model in "$QWEN" "$LFM"; do
+  name=$(basename "$model" .gguf)
+  for prompt in "The capital of France is" "The quick brown fox jumps over the lazy dog"; do
+    # batched (default M=512) vs token-at-a-time (M=1): same greedy top-1
+    # compare the greedy TOKEN (id+text); the logit itself differs at f32
+    # accumulation-order level (vectorized attention core vs scalar decode)
+    a=$("$LLAMA_RS" -m "$model" --mode debug --no-bos -p "$prompt" -t 1 2>/dev/null | grep "^top1:" | grep -oE "id=[0-9]+")
+    b=$(LLAMA_RS_PREFILL_M=1 "$LLAMA_RS" -m "$model" --mode debug --no-bos -p "$prompt" -t 1 2>/dev/null | grep "^top1:" | grep -oE "id=[0-9]+")
+    if [ -n "$a" ] && [ "$a" == "$b" ]; then check "batch==token top1 [$name] '${prompt:0:20}…'" 1; else check "batch==token top1 [$name] '${prompt:0:20}…' (batch=$a token=$b)" 0; fi
+    # batchcmp: logits self-check (decode path reference vs batched path)
+    bc=$("$LLAMA_RS" -m "$model" --mode batchcmp --no-bos -p "$prompt" -t 2 --ctx 2048 2>/dev/null | grep -o "MATCH\|DIFFER")
+    if [ "$bc" == "MATCH" ]; then check "batchcmp logits [$name] '${prompt:0:20}…'" 1; else check "batchcmp logits [$name] '${prompt:0:20}…' ($bc)" 0; fi
+  done
+done
+
 echo "== [3] dequantization: llama.rs vs C reference (original ggml code) =="
 gcc -O2 -o /tmp/ref_q5 "$SCRIPT_DIR/ref_q5.c"
 gcc -O2 -o /tmp/ref_q6 "$SCRIPT_DIR/ref_q6.c"

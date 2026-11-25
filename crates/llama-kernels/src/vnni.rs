@@ -931,6 +931,334 @@ pub fn matvec2_vnni(
     }
 }
 
+// ---------- batched GEMM (Phase 6.5: prefill M>1) ----------
+//
+// Structure: the activation matrix (M token rows × n_in, row-major f32) is
+// quantized ONCE per input (QBatch — one row per token, the same quantizer
+// contract as the M=1 path), then each 16-column group of the packed weights
+// is streamed against all M rows: for every (group, row) pair the inner
+// compute is exactly `group_dot_*` — the same dpbusd sequence, the same
+// accumulation order — so every output column of the GEMM is bit-identical
+// to running `matvec_vnni` on that single token. Weight tiles are read from
+// DRAM once per batch (the group loop is outer, the token loop inner; tiles
+// stay L1/L2-resident across the M rows), which is the entire batching win:
+// DRAM traffic per weight byte drops from once-per-token to once-per-batch.
+
+/// Quantized activation matrix for the packed GEMM — M rows, one per token,
+/// each row exactly what `matvec_vnni` would produce for that token
+/// (Q8_0 rows: 34·n_in/32 bytes; Q8_K rows: 292·n_in/256 bytes).
+pub struct QBatch {
+    data: Vec<u8>,
+    row_bytes: usize,
+    rows: usize,
+}
+
+impl QBatch {
+    #[inline]
+    pub fn row(&self, m: usize) -> &[u8] {
+        &self.data[m * self.row_bytes..(m + 1) * self.row_bytes]
+    }
+    #[inline]
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+impl Drop for QBatch {
+    fn drop(&mut self) {
+        // return the buffer to the scratch pool (grow-only, bounded)
+        let pool = QSCRATCH.get_or_init(|| QScratch { free: std::sync::Mutex::new(Vec::new()) });
+        let mut free = pool.free.lock().unwrap();
+        if free.len() < 8 {
+            free.push(std::mem::take(&mut self.data));
+        }
+    }
+}
+
+fn take_batch(bytes: usize) -> Vec<u8> {
+    let pool = QSCRATCH.get_or_init(|| QScratch { free: std::sync::Mutex::new(Vec::new()) });
+    let mut free = pool.free.lock().unwrap();
+    let mut buf = match free.pop() {
+        Some(b) if b.len() >= bytes => b,
+        Some(b) => {
+            let mut b = b;
+            b.resize(bytes, 0);
+            b
+        }
+        None => vec![0u8; bytes],
+    };
+    if buf.len() != bytes {
+        buf.resize(bytes, 0);
+    }
+    drop(free);
+    buf
+}
+
+/// Row bytes of a quantized activation row for weight type `ty`.
+#[inline]
+fn batch_row_bytes(ty: GgmlType, n_in: usize) -> usize {
+    match ty {
+        GgmlType::Q8_0 | GgmlType::Q5_0 => {
+            assert!(n_in % TILE_K == 0);
+            (n_in / TILE_K) * 34
+        }
+        GgmlType::Q4_K | GgmlType::Q6_K => {
+            assert!(n_in % QK_K == 0);
+            (n_in / QK_K) * 292
+        }
+        other => unreachable!("packed GEMM does not support {other:?}"),
+    }
+}
+
+/// Quantize the M×n_in row-major activation matrix `x` for weight type `ty`.
+/// Rows are quantized independently (each token = one M=1 contract); with
+/// n_threads > 1 the row range is split between caller and worker.
+pub fn quantize_batch(
+    ty: GgmlType,
+    x: &[f32],
+    n_in: usize,
+    m: usize,
+    n_threads: usize,
+) -> QBatch {
+    debug_assert_eq!(x.len(), n_in * m);
+    let row_bytes = batch_row_bytes(ty, n_in);
+    let mut data = take_batch(m * row_bytes);
+    let quant_row = |mm: usize, dst: &mut [u8]| {
+        let src = &x[mm * n_in..(mm + 1) * n_in];
+        if matches!(ty, GgmlType::Q4_K | GgmlType::Q6_K) {
+            quant::quantize_row_q8_k(src, dst);
+        } else {
+            quant::quantize_row_q8_0(src, dst);
+        }
+    };
+    let n_threads = n_threads.max(1);
+    if n_threads <= 1 || m < 16 {
+        for mm in 0..m {
+            quant_row(mm, &mut data[mm * row_bytes..(mm + 1) * row_bytes]);
+        }
+    } else {
+        // split the row range between caller and worker through raw pointers
+        // (disjoint halves; the pool join precedes the return — same pattern
+        // as the matvec band jobs)
+        let mid = (m / 2).max(1).min(m - 1);
+        let base = data.as_mut_ptr();
+        let lo = move || unsafe {
+            for mm in 0..mid {
+                let dst = std::slice::from_raw_parts_mut(base.add(mm * row_bytes), row_bytes);
+                quant_row(mm, dst);
+            }
+        };
+        let hi = move || unsafe {
+            for mm in mid..m {
+                let dst = std::slice::from_raw_parts_mut(base.add(mm * row_bytes), row_bytes);
+                quant_row(mm, dst);
+            }
+        };
+        pool::par_chunks2(lo, hi);
+    }
+    QBatch { data, row_bytes, rows: m }
+}
+
+/// One (group, row) dot for any supported packed type — dispatch by `ty`.
+/// Returns the 16 outputs of tile `group` against quantized row `q_row`.
+#[inline]
+unsafe fn group_dot_any(ty: GgmlType, q_row: &[u8], kb: usize, packed: &[u8], group: usize) -> [f32; TILE_N] {
+    match ty {
+        GgmlType::Q4_K => group_dot_q4_k(q_row, kb, packed, group),
+        GgmlType::Q6_K => group_dot_q6_k(q_row, kb, packed, group),
+        // Q8_0/Q5_0 share the 576 B tile + q8_0-activation kernel
+        _ => group_dot_q8_0(q_row, kb, packed, group),
+    }
+}
+
+/// Band of a packed GEMM: groups [g_lo, g_hi) × all M rows, writing
+/// out[m * out_stride + g*16 .. +16]. Weights stream once; rows hit L1/L2.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_band(
+    packed: &[u8],
+    ty: GgmlType,
+    q: &QBatch,
+    kb: usize,
+    g_lo: usize,
+    g_hi: usize,
+    out: *mut f32,
+    out_stride: usize,
+    is_caller: bool,
+) {
+    let t0 = if kstats::enabled() { kstats::tsc() } else { 0 };
+    for g in g_lo..g_hi {
+        for m in 0..q.rows() {
+            let r = group_dot_any(ty, q.row(m), kb, packed, g);
+            let dst = out.add(m * out_stride + g * TILE_N);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), dst, TILE_N);
+        }
+    }
+    if kstats::enabled() {
+        let dt = kstats::tsc().wrapping_sub(t0);
+        kstats::DOT_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        if is_caller {
+            kstats::CALLER_BAND_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Packed GEMM with a pre-quantized activation batch:
+/// `out[m * n_out + o] = Σ_i x[m, i] · W[i, o]` for every token row m.
+/// `out` is M×n_out row-major (the next op reads token rows contiguously).
+pub fn gemm_prepared(
+    packed: &PackedTensor,
+    q: &QBatch,
+    n_threads: usize,
+    out: &mut [f32],
+) {
+    let n_out = packed.n_out;
+    debug_assert_eq!(out.len(), q.rows() * n_out);
+    let kb = match packed.ty {
+        GgmlType::Q8_0 | GgmlType::Q5_0 => packed.n_in / TILE_K,
+        GgmlType::Q4_K | GgmlType::Q6_K => packed.n_in / QK_K,
+        other => unreachable!("packed GEMM does not support {other:?}"),
+    };
+    if q.rows() == 0 {
+        return;
+    }
+    if kstats::enabled() {
+        kstats::MATVECS.fetch_add(q.rows() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let tw0 = if kstats::enabled() { kstats::tsc() } else { 0 };
+    let ng = n_out / TILE_N;
+    let n_threads = n_threads.max(1);
+    let stride = n_out;
+    if n_threads <= 1 || ng < 2 || q.rows() < 4 {
+        let ptr = out.as_mut_ptr();
+        unsafe { gemm_band(&packed.data, packed.ty, q, kb, 0, ng, ptr, stride, true) };
+    } else {
+        let g_mid = (ng / 2).clamp(1, ng - 1);
+        let ptr = out.as_mut_ptr();
+        let caller = gemm_band_job(&packed.data, packed.ty, q, kb, ptr, stride, 0, g_mid, true);
+        let worker = gemm_band_job(&packed.data, packed.ty, q, kb, ptr, stride, g_mid, ng, false);
+        pool::par_chunks2(caller, worker);
+    }
+    if kstats::enabled() {
+        kstats::MATVEC_WALL_TICKS.fetch_add(kstats::tsc().wrapping_sub(tw0), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Band-job factory for the GEMM bands.
+#[allow(clippy::too_many_arguments)]
+fn gemm_band_job<'a>(
+    packed: &'a [u8],
+    ty: GgmlType,
+    q: &'a QBatch,
+    kb: usize,
+    out: *mut f32,
+    out_stride: usize,
+    g_lo: usize,
+    g_hi: usize,
+    is_caller: bool,
+) -> impl FnMut() + 'a {
+    move || unsafe { gemm_band(packed, ty, q, kb, g_lo, g_hi, out, out_stride, is_caller) }
+}
+
+/// Fused packed GEMM pair (gate/up) over the concatenated group space —
+/// one QBatch, one dispatch, both outputs. `out1`/`out2` are M×n_out1/n_out2
+/// row-major. Both tensors must share `ty`/`n_in` (asserted by callers).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm2_prepared(
+    p1: &PackedTensor,
+    p2: &PackedTensor,
+    q: &QBatch,
+    n_threads: usize,
+    out1: &mut [f32],
+    out2: &mut [f32],
+) {
+    debug_assert_eq!(p1.ty, p2.ty);
+    debug_assert_eq!(p1.n_in, p2.n_in);
+    if p1.ty != p2.ty {
+        // mixed pair: two separate GEMMs (correct, one extra quantization)
+        gemm_prepared(p1, q, n_threads, out1);
+        gemm_prepared(p2, q, n_threads, out2);
+        return;
+    }
+    let ng1 = p1.n_out / TILE_N;
+    let ng2 = p2.n_out / TILE_N;
+    let ng = ng1 + ng2;
+    debug_assert_eq!(out1.len(), q.rows() * p1.n_out);
+    debug_assert_eq!(out2.len(), q.rows() * p2.n_out);
+    if q.rows() == 0 {
+        return;
+    }
+    if kstats::enabled() {
+        kstats::MATVECS.fetch_add(2 * q.rows() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let tw0 = if kstats::enabled() { kstats::tsc() } else { 0 };
+    let kb = match p1.ty {
+        GgmlType::Q8_0 | GgmlType::Q5_0 => p1.n_in / TILE_K,
+        _ => p1.n_in / QK_K,
+    };
+    let stride1 = p1.n_out;
+    let stride2 = p2.n_out;
+    let n_threads = n_threads.max(1);
+    if n_threads <= 1 || ng < 2 || q.rows() < 4 {
+        let o1 = out1.as_mut_ptr();
+        let o2 = out2.as_mut_ptr();
+        unsafe { gemm2_band(&p1.data, p1.ty, ng1, &p2.data, q, kb, 0, ng, o1, o2, stride1, stride2, true) };
+    } else {
+        let g_mid = (ng / 2).clamp(1, ng - 1);
+        let o1 = out1.as_mut_ptr();
+        let o2 = out2.as_mut_ptr();
+        let caller = move || unsafe {
+            gemm2_band(&p1.data, p1.ty, ng1, &p2.data, q, kb, 0, g_mid, o1, o2, stride1, stride2, true)
+        };
+        let worker = move || unsafe {
+            gemm2_band(&p1.data, p1.ty, ng1, &p2.data, q, kb, g_mid, ng, o1, o2, stride1, stride2, false)
+        };
+        pool::par_chunks2(caller, worker);
+    }
+    if kstats::enabled() {
+        kstats::MATVEC_WALL_TICKS.fetch_add(kstats::tsc().wrapping_sub(tw0), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Band of the fused GEMM pair (concatenated group space [0, ng1+ng2)).
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn gemm2_band(
+    p1: &[u8],
+    ty: GgmlType,
+    ng1: usize,
+    p2: &[u8],
+    q: &QBatch,
+    kb: usize,
+    g_lo: usize,
+    g_hi: usize,
+    out1: *mut f32,
+    out2: *mut f32,
+    stride1: usize,
+    stride2: usize,
+    is_caller: bool,
+) {
+    let t0 = if kstats::enabled() { kstats::tsc() } else { 0 };
+    for g in g_lo..g_hi {
+        let (pp, o_ptr, o_stride, gg) = if g < ng1 {
+            (p1, out1, stride1, g)
+        } else {
+            (p2, out2, stride2, g - ng1)
+        };
+        for m in 0..q.rows() {
+            let r = group_dot_any(ty, q.row(m), kb, pp, gg);
+            let dst = o_ptr.add(m * o_stride + gg * TILE_N);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), dst, TILE_N);
+        }
+    }
+    if kstats::enabled() {
+        let dt = kstats::tsc().wrapping_sub(t0);
+        kstats::DOT_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        if is_caller {
+            kstats::CALLER_BAND_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// A repacked weight tensor (the engine's analog of the packed buffer of
 /// llama.cpp's AMX backend — VNNI layout, no tile registers involved).
 #[derive(Clone)]

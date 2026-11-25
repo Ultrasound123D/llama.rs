@@ -238,9 +238,63 @@ impl GgufFile {
         &self.data[start..start + len]
     }
 
+    /// Phase 6.5 memory reclaim: drop the physical pages backing one
+    /// tensor's bytes (MADV_DONTNEED on the interior page-aligned range —
+    /// boundary pages shared with neighbours stay resident, so no other
+    /// tensor is ever touched). The tensor is DEAD after this: subsequent
+    /// reads return zeros. Callers use it only for tensors whose data has
+    /// been fully repacked into a separate packed buffer and will never be
+    /// read through `tensor_bytes` again. Returns the bytes released.
+    /// Env `LLAMA_RS_MEM_KEEP=1` disables the release (A/B knob).
+    pub fn free_tensor_pages(&self, t: &TensorInfo) -> usize {
+        if std::env::var("LLAMA_RS_MEM_KEEP").is_ok() {
+            return 0;
+        }
+        let off = self.data_start as usize + t.offset as usize;
+        let len = tensor_bytes(t) as usize;
+        let start = off + self.data.as_ptr() as usize;
+        let end = start + len;
+        const PAGE: usize = 4096;
+        let p_lo = (start + PAGE - 1) & !(PAGE - 1); // first interior page
+        let p_hi = end & !(PAGE - 1);                 // last interior page bound
+        if p_hi <= p_lo {
+            return 0; // tensor smaller than a page — keep it
+        }
+        let rel = p_hi - p_lo;
+        if !sys_madvise_dontneed(p_lo, rel) {
+            return 0;
+        }
+        rel
+    }
+
     pub fn n_bytes_total(&self) -> u64 {
         self.tensors.iter().map(tensor_bytes).sum()
     }
+}
+
+/// Raw `madvise(2)` via syscall (no libc dependency; Linux x86-64).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn sys_madvise_dontneed(addr: usize, len: usize) -> bool {
+    use std::arch::asm;
+    let ret: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") 28i64 => ret,  // __NR_madvise
+            in("rdi") addr,
+            in("rsi") len,
+            in("rdx") 4u64,                 // MADV_DONTNEED
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    ret == 0
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn sys_madvise_dontneed(_addr: usize, _len: usize) -> bool {
+    false
 }
 
 fn tensor_bytes(t: &TensorInfo) -> u64 {

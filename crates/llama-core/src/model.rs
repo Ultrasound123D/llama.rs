@@ -31,6 +31,7 @@ fn build_packed(gguf: &GgufFile) -> PackedMap {
         return m;
     }
     let mut skipped: Vec<String> = Vec::new();
+    let mut freed_bytes: usize = 0;
     for t in &gguf.tensors {
         if t.name == "token_embd.weight" {
             continue;
@@ -43,6 +44,13 @@ fn build_packed(gguf: &GgufFile) -> PackedMap {
         match llama_kernels::vnni::repack_tensor(t.ty, data, n_in, n_out) {
             Some(p) => {
                 m.insert(t.name.clone(), p);
+                // Phase 6.5: the original tensor bytes are dead once the
+                // packed copy exists (every matmul/GEMM site dispatches
+                // through the packed map; tensors that fail repack never
+                // reach here). Return the pages to the OS — steady-state
+                // RSS drops from ~2× to ~1× model, and peak stays bounded
+                // because each tensor is freed as soon as it is repacked.
+                freed_bytes += gguf.free_tensor_pages(t);
             }
             None => skipped.push(format!("{} {:?} {}x{}", t.name, t.ty, n_in, n_out)),
         }
@@ -50,6 +58,7 @@ fn build_packed(gguf: &GgufFile) -> PackedMap {
     if std::env::var("LLAMA_RS_DEBUG_PACK").is_ok() {
         eprintln!("[packed] {} tensors repacked; skipped {}:", m.len(), skipped.len());
         for s in &skipped { eprintln!("  [packed-skip] {s}"); }
+        eprintln!("[packed] original tensor pages released: {:.1} MB", freed_bytes as f64 / 1e6);
     }
     m
 }
@@ -128,6 +137,155 @@ fn pbucket(name: &str) -> &'static prof::Bucket {
     prof::bucket(name)
 }
 
+// ============ Phase 6.5: batched prefill (M>1 GEMM path) ============
+//
+// `forward_batch(tokens)` runs M tokens through one forward pass: every
+// matmul becomes a packed VNNI GEMM (weights stream once per batch instead
+// of once per token — the prefill gap was memory-bound streaming), the
+// attention core is causal/SWA over the batch, and all activations live in
+// reusable batch buffers. The M=1 decode path (`forward`) is untouched.
+// `prefill()` chunks the prompt at `LLAMA_RS_PREFILL_M` (default 512) and
+// routes M=1 to `forward` so decode numerics stay byte-identical.
+
+/// Max tokens per batched prefill call (env `LLAMA_RS_PREFILL_M`, default
+/// 512 — llama.cpp's ubatch size). 1 disables batching (token-at-a-time).
+/// Read per call (cheap: once per batch, not per token) so tools like the
+/// CLI batchcmp mode can A/B batch sizes within one process.
+pub fn prefill_batch_max() -> usize {
+    std::env::var("LLAMA_RS_PREFILL_M")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(512)
+}
+
+/// Packed-GEMM dispatch for one tensor: `x_rows` is M×n_in row-major,
+/// `out` is M×n_out row-major. Falls back to per-row matvec for tensors
+/// without a packed entry (non-VNNI machines / repack misses).
+fn pgemm(
+    gguf: &GgufFile,
+    packed: &PackedMap,
+    name: &str,
+    x_rows: &[f32],
+    m: usize,
+    n_threads: usize,
+    out: &mut [f32],
+) {
+    let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+    if let Some(p) = packed.get(name) {
+        let q = llama_kernels::vnni::quantize_batch(p.ty, &x_rows[..p.n_in * m], p.n_in, m, n_threads);
+        llama_kernels::vnni::gemm_prepared(p, &q, n_threads, out);
+        if prof::prof_enabled() {
+            if let Some(t) = gguf.tensor(name) {
+                let class = prof::tensor_class(name);
+                let b = prof::bucket(&format!("gemm {class} {:?}", t.ty));
+                b.bytes.fetch_add(gguf.tensor_bytes(t).len() as u64, std::sync::atomic::Ordering::Relaxed);
+                prof::record(b, t0, 0);
+            }
+        }
+    } else {
+        let w = crate::W::get(gguf, name);
+        let (n_in, n_out) = (w.n_in, w.n_out);
+        for r in 0..m {
+            w.matvec(&x_rows[r * n_in..(r + 1) * n_in], &mut out[r * n_out..(r + 1) * n_out], n_threads);
+        }
+    }
+}
+
+/// Fused packed-GEMM pair (gate/up): one quantization + one band dispatch
+/// across the concatenated column space. Mixed types fall back to two
+/// `pgemm` calls.
+#[allow(clippy::too_many_arguments)]
+fn pgemm2(
+    gguf: &GgufFile,
+    packed: &PackedMap,
+    name1: &str,
+    name2: &str,
+    x_rows: &[f32],
+    m: usize,
+    n_threads: usize,
+    out1: &mut [f32],
+    out2: &mut [f32],
+) {
+    if let (Some(p1), Some(p2)) = (packed.get(name1), packed.get(name2)) {
+        if p1.ty == p2.ty && p1.n_in == p2.n_in {
+            let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            let q = llama_kernels::vnni::quantize_batch(p1.ty, &x_rows[..p1.n_in * m], p1.n_in, m, n_threads);
+            llama_kernels::vnni::gemm2_prepared(p1, p2, &q, n_threads, out1, out2);
+            if prof::prof_enabled() {
+                let bytes = |n: &str| gguf.tensor(n).map(|t| gguf.tensor_bytes(t).len() as u64).unwrap_or(0);
+                if let Some(t) = gguf.tensor(name1) {
+                    let class = prof::tensor_class(name1);
+                    let b = prof::bucket(&format!("gemm {class} {:?}", t.ty));
+                    b.bytes.fetch_add(bytes(name1) + bytes(name2), std::sync::atomic::Ordering::Relaxed);
+                    prof::record(b, t0, 0);
+                }
+            }
+            return;
+        }
+    }
+    pgemm(gguf, packed, name1, x_rows, m, n_threads, out1);
+    pgemm(gguf, packed, name2, x_rows, m, n_threads, out2);
+}
+
+/// Multi-tensor GEMM sharing one activation quantization per weight type
+/// (q/k/v/gate read the same rows): indices are bucketed by (ty, n_in),
+/// one QBatch per bucket, one gemm_prepared per tensor.
+fn pgemm_shared(
+    gguf: &GgufFile,
+    packed: &PackedMap,
+    names: &[&str],
+    x_rows: &[f32],
+    m: usize,
+    n_threads: usize,
+    outs: &mut [&mut [f32]],
+) {
+    let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+    // linear bucket scan (GgmlType has no Hash; ≤ 2 buckets in practice)
+    let mut buckets: Vec<((llama_gguf::GgmlType, usize), Vec<usize>)> = Vec::new();
+    let mut plain: Vec<usize> = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        if let Some(p) = packed.get(*name) {
+            let key = (p.ty, p.n_in);
+            if let Some((_, v)) = buckets.iter_mut().find(|(k, _)| *k == key) {
+                v.push(i);
+            } else {
+                buckets.push((key, vec![i]));
+            }
+        } else {
+            plain.push(i);
+        }
+    }
+    for ((ty, n_in), idxs) in buckets {
+        let q = llama_kernels::vnni::quantize_batch(ty, &x_rows[..n_in * m], n_in, m, n_threads);
+        for &i in &idxs {
+            let p = packed.get(names[i]).unwrap();
+            llama_kernels::vnni::gemm_prepared(p, &q, n_threads, outs[i]);
+            if prof::prof_enabled() {
+                if let Some(t) = gguf.tensor(names[i]) {
+                    let class = prof::tensor_class(names[i]);
+                    let b = prof::bucket(&format!("gemm {class} {:?}", t.ty));
+                    b.bytes.fetch_add(gguf.tensor_bytes(t).len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    prof::record(b, t0, 0);
+                }
+            }
+        }
+    }
+    for i in plain {
+        let w = crate::W::get(gguf, names[i]);
+        let (n_in, n_out) = (w.n_in, w.n_out);
+        for r in 0..m {
+            w.matvec(&x_rows[r * n_in..(r + 1) * n_in], &mut outs[i][r * n_out..(r + 1) * n_out], n_threads);
+        }
+    }
+}
+
+/// Row split point for caller/worker bands (m ≥ 2).
+#[inline]
+fn row_split(m: usize) -> usize {
+    (m / 2).max(1).min(m - 1)
+}
+
 // ============ LFM3 ============
 
 pub struct Lfm3 {
@@ -175,6 +333,58 @@ pub struct Lfm3 {
     w_q_norm: Vec<Vec<f32>>,
     w_k_norm: Vec<Vec<f32>>,
     w_output_norm: Vec<f32>,
+    /// Phase 6.5: reusable batched-prefill buffers (allocated on first
+    /// forward_batch; `None` keeps the pure-decode footprint untouched)
+    b: Option<Box<Lfm3Batch>>,
+}
+
+/// Reusable activation arena for LFM3 batched prefill — one allocation at
+/// the first batch, rows reused for every batch afterwards.
+struct Lfm3Batch {
+    x: Vec<f32>,        // M × n_e   residual stream
+    h: Vec<f32>,        // M × n_e   attn_norm / ffn_norm out
+    q: Vec<f32>,        // M × n_e
+    k: Vec<f32>,        // M × nkv·hd
+    v: Vec<f32>,        // M × nkv·hd
+    gate_h: Vec<f32>,   // M × n_head (attn_gate rows)
+    attn: Vec<f32>,     // M × n_e   gated attention out (pre out_proj)
+    branch: Vec<f32>,   // M × n_e   token-mixer out (post norm)
+    ffn_h: Vec<f32>,    // M × n_e
+    gate: Vec<f32>,     // M × n_ff
+    up: Vec<f32>,       // M × n_ff
+    ffni: Vec<f32>,     // M × n_ff   swiglu out
+    ffn_out: Vec<f32>,  // M × n_e
+    in_proj: Vec<f32>,  // M × 3n_e  shortconv in_proj
+    conv_w: Vec<f32>,   // n_e × (M + d_conv) channel-major window
+    conv_y: Vec<f32>,   // M × n_e
+    scores: Vec<f32>,   // per-band softmax scratch
+    scores2: Vec<f32>,
+}
+
+impl Lfm3Batch {
+    fn new(m_max: usize, n_e: usize, n_ff: usize, nkv: usize, hd: usize, nh: usize,
+           d_conv: usize, n_ctx: usize) -> Lfm3Batch {
+        Lfm3Batch {
+            x: vec![0f32; m_max * n_e],
+            h: vec![0f32; m_max * n_e],
+            q: vec![0f32; m_max * n_e],
+            k: vec![0f32; m_max * nkv * hd],
+            v: vec![0f32; m_max * nkv * hd],
+            gate_h: vec![0f32; m_max * nh],
+            attn: vec![0f32; m_max * n_e],
+            branch: vec![0f32; m_max * n_e],
+            ffn_h: vec![0f32; m_max * n_e],
+            gate: vec![0f32; m_max * n_ff],
+            up: vec![0f32; m_max * n_ff],
+            ffni: vec![0f32; m_max * n_ff],
+            ffn_out: vec![0f32; m_max * n_e],
+            in_proj: vec![0f32; m_max * 3 * n_e],
+            conv_w: vec![0f32; n_e * (m_max + d_conv)],
+            conv_y: vec![0f32; m_max * n_e],
+            scores: vec![0f32; n_ctx],
+            scores2: vec![0f32; n_ctx],
+        }
+    }
 }
 
 impl Lfm3 {
@@ -261,6 +471,7 @@ impl Lfm3 {
             logits: vec![0f32; 0],
             w_attn_norm, w_ffn_norm, w_post_anorm, w_post_fnorm,
             w_q_norm, w_k_norm, w_output_norm,
+            b: None,
             gguf,
         }
     }
@@ -333,6 +544,7 @@ impl Lfm3 {
                 prof::record(pbucket("elementwise"), te1, 0);
             }
         }
+
 
         // ----- output head -----
         let xn = rmsnorm(&x, &self.w_output_norm, self.eps);
@@ -491,6 +703,482 @@ impl Lfm3 {
         for s in self.conv_state.iter_mut() { s.iter_mut().for_each(|v| *v = 0.0); }
         self.pos = 0;
     }
+
+    /// Prefill `tokens` in batches of ≤ `prefill_batch_max()` — the batched
+    /// M>1 path. Returns the logits of the LAST token. M=1 batches (and
+    /// LLAMA_RS_PREFILL_M=1) route through `forward` — the decode path —
+    /// so batched prefill never changes the M=1 numerics.
+    pub fn prefill(&mut self, tokens: &[u32]) -> &[f32] {
+        let max_m = prefill_batch_max();
+        if tokens.is_empty() {
+            return &self.logits;
+        }
+        if max_m == 1 || tokens.len() == 1 {
+            for &t in tokens {
+                self.forward(t);
+            }
+            return &self.logits;
+        }
+        for chunk in tokens.chunks(max_m) {
+            self.forward_batch(chunk);
+        }
+        &self.logits
+    }
+
+    /// One batched forward over M tokens (1 < M ≤ prefill_batch_max()).
+    /// KV/conv caches advance by M; logits = last row's output head.
+    pub fn forward_batch(&mut self, tokens: &[u32]) -> &[f32] {
+        use llama_kernels::pool::par_chunks2;
+        let m = tokens.len();
+        debug_assert!(m >= 1);
+        debug_assert!(m <= prefill_batch_max(), "call prefill() to chunk");
+        let n_e = self.n_embd;
+        let pos0 = self.pos;
+        let eps = self.eps;
+        let nt = self.n_threads;
+
+        // batch arena (allocated on first use)
+        if self.b.is_none() {
+            self.b = Some(Box::new(Lfm3Batch::new(
+                prefill_batch_max(), n_e, self.n_ff, self.n_head_kv, self.head_dim,
+                self.n_head, self.d_conv, self.n_ctx,
+            )));
+        }
+        let mut b = self.b.take().unwrap();
+
+        // embedding rows
+        {
+            let tok_emb = W::get(&self.gguf, "token_embd.weight");
+            for (t, row) in tokens.iter().zip(b.x.chunks_exact_mut(n_e)) {
+                let col = tok_emb.column(*t as usize, n_e);
+                row.copy_from_slice(&col);
+            }
+        }
+
+        let mut attn_idx = 0usize;
+        let mut recr_idx = 0usize;
+        for il in 0..self.n_layer {
+            // ---- attn_norm rows ----
+            {
+                let w = &self.w_attn_norm[il];
+                let (x, h) = (&b.x, &mut b.h);
+                if m >= 2 {
+                    let mid = row_split(m);
+                    // h split at the band boundary; the hi band indexes its
+                    // own half with LOCAL row numbers (absolute r - mid)
+                    let (h_lo, h_hi) = h.split_at_mut(mid * n_e);
+                    let lo = move || {
+                        for r in 0..mid {
+                            rmsnorm_into(&x[r * n_e..][..n_e], w, eps, &mut h_lo[r * n_e..][..n_e]);
+                        }
+                    };
+                    let hi = move || {
+                        for r in 0..(m - mid) {
+                            rmsnorm_into(&x[(mid + r) * n_e..][..n_e], w, eps, &mut h_hi[r * n_e..][..n_e]);
+                        }
+                    };
+                    par_chunks2(lo, hi);
+                } else {
+                    for r in 0..m { rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.h[r * n_e..][..n_e]); }
+                }
+            }
+
+            // ---- token mixer ----
+            if self.is_recr[il] {
+                self.shortconv_block_batch(il, recr_idx, m, &mut b);
+                recr_idx += 1;
+            } else {
+                self.attn_block_batch(il, attn_idx, pos0, m, &mut b);
+                attn_idx += 1;
+            }
+            // post_attention_norm rows (in place on the mixer output)
+            if let Some(w) = &self.w_post_anorm[il] {
+                let w = w;
+                let branch = &mut b.branch[..m * n_e];
+                for r in 0..m {
+                    rmsnorm_inplace(&mut branch[r * n_e..][..n_e], w, eps);
+                }
+            }
+            // residual add
+            {
+                let (x, br) = (&mut b.x, &b.branch);
+                for r in 0..m {
+                    let (xr, brr) = (&mut x[r * n_e..][..n_e], &br[r * n_e..][..n_e]);
+                    for i in 0..n_e { xr[i] += brr[i]; }
+                }
+            }
+
+            // ---- FFN ----
+            {
+                let w = &self.w_ffn_norm[il];
+                for r in 0..m { rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.ffn_h[r * n_e..][..n_e]); }
+            }
+            {
+                let gate_name = format!("blk.{il}.ffn_gate.weight");
+                let up_name = format!("blk.{il}.ffn_up.weight");
+                let (gguf, packed) = (&self.gguf, &self.packed);
+                pgemm2(gguf, packed, &gate_name, &up_name, &b.ffn_h, m, nt, &mut b.gate, &mut b.up);
+            }
+            // swiglu rows
+            {
+                let (g, u, f) = (&b.gate, &b.up, &mut b.ffni);
+                let n_ff = self.n_ff;
+                for r in 0..m {
+                    let (gr, ur, fr) = (&g[r * n_ff..][..n_ff], &u[r * n_ff..][..n_ff], &mut f[r * n_ff..][..n_ff]);
+                    for i in 0..n_ff { fr[i] = silu(gr[i]) * ur[i]; }
+                }
+            }
+            {
+                let down_name = format!("blk.{il}.ffn_down.weight");
+                let (gguf, packed) = (&self.gguf, &self.packed);
+                pgemm(gguf, packed, &down_name, &b.ffni, m, nt, &mut b.ffn_out);
+            }
+            if let Some(w) = &self.w_post_fnorm[il] {
+                let w = w;
+                let ffn_out = &mut b.ffn_out[..m * n_e];
+                for r in 0..m {
+                    rmsnorm_inplace(&mut ffn_out[r * n_e..][..n_e], w, eps);
+                }
+            }
+            {
+                let (x, fo) = (&mut b.x, &b.ffn_out);
+                for r in 0..m {
+                    let (xr, fr) = (&mut x[r * n_e..][..n_e], &fo[r * n_e..][..n_e]);
+                    for i in 0..n_e { xr[i] += fr[i]; }
+                }
+            }
+
+        }
+
+        // ---- output head (last row only) ----
+        {
+            let last = &b.x[(m - 1) * n_e..][..n_e];
+            let xn = rmsnorm(last, &self.w_output_norm, eps);
+            let out_w_name = if self.gguf.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+            let n_out = self.gguf.tensor(out_w_name).map(|t| t.dims[1] as usize).unwrap_or(0);
+            if self.logits.len() != n_out {
+                self.logits = vec![0f32; n_out];
+            }
+            let (gguf, packed) = (&self.gguf, &self.packed);
+            let logits = &mut self.logits;
+            pmv(gguf, packed, out_w_name, &xn, logits, nt);
+        }
+
+        self.pos += m;
+        self.b = Some(b);
+        &self.logits
+    }
+
+    /// Batched attention layer: q/k/v/gate GEMMs from `h` (M×n_e rows),
+    /// per-head q/k norm + rope per row, M KV appends, causal/SWA attention
+    /// over the cache, head gates, out_proj GEMM. Writes the pre-norm mixer
+    /// output (attn_out rows) into `b.branch`.
+    fn attn_block_batch(&mut self, il: usize, attn_idx: usize, pos0: usize, m: usize, b: &mut Lfm3Batch) {
+        use llama_kernels::pool::par_chunks2;
+        let hd = self.head_dim;
+        let nh = self.n_head;
+        let nkv = self.n_head_kv;
+        let n_e = self.n_embd;
+        let rep = nh / nkv;
+        let nt = self.n_threads;
+        let (k_row, v_row) = (nkv * hd, nkv * hd);
+
+        // q/k/v/gate GEMMs — one quantization per weight type
+        {
+            let (gguf, packed, h) = (&self.gguf, &self.packed, &b.h[..m * n_e]);
+            let q_name = format!("blk.{il}.attn_q.weight");
+            let k_name = format!("blk.{il}.attn_k.weight");
+            let v_name = format!("blk.{il}.attn_v.weight");
+            let g_name = format!("blk.{il}.attn_gate.weight");
+            let names = [q_name.as_str(), k_name.as_str(), v_name.as_str(), g_name.as_str()];
+            let mut outs: [&mut [f32]; 4] = [
+                &mut b.q[..m * n_e],
+                &mut b.k[..m * k_row],
+                &mut b.v[..m * v_row],
+                &mut b.gate_h[..m * nh],
+            ];
+            pgemm_shared(gguf, packed, &names, h, m, nt, &mut outs);
+        }
+
+        // q/k norm + rope per (row, head) — rows split between threads
+        {
+            let w_q = &self.w_q_norm[il];
+            let w_k = &self.w_k_norm[il];
+            let (base_full, freqs) = (self.rope_base_full, self.rope_freqs.as_deref());
+            let base_swa = self.rope_base_swa;
+            let is_swa = self.is_swa[il];
+            let eps = self.eps;
+            let (q, k) = (&mut b.q[..m * n_e], &mut b.k[..m * k_row]);
+            if m >= 2 {
+                let mid = row_split(m);
+                let (q_lo, q_hi) = q.split_at_mut(mid * n_e);
+                let (k_lo, k_hi) = k.split_at_mut(mid * k_row);
+                let lo = move || {
+                    for r in 0..mid {
+                        qk_norm_rope_row(&mut q_lo[r * n_e..][..n_e], &mut k_lo[r * k_row..][..k_row],
+                            pos0 + r, w_q, w_k, eps, is_swa, base_full, base_swa, freqs);
+                    }
+                };
+                let hi = move || {
+                    for r in 0..(m - mid) {
+                        qk_norm_rope_row(&mut q_hi[r * n_e..][..n_e], &mut k_hi[r * k_row..][..k_row],
+                            pos0 + mid + r, w_q, w_k, eps, is_swa, base_full, base_swa, freqs);
+                    }
+                };
+                par_chunks2(lo, hi);
+            } else {
+                for r in 0..m {
+                    qk_norm_rope_row(&mut b.q[r * n_e..][..n_e], &mut b.k[r * k_row..][..k_row],
+                        pos0 + r, w_q, w_k, eps, is_swa, base_full, base_swa, freqs);
+                }
+            }
+        }
+
+        // head gates: sigmoid per element
+        for v in b.gate_h[..m * nh].iter_mut() {
+            *v = sigmoid(*v);
+        }
+
+        // KV append (M rows)
+        {
+            let len = self.kv_len[attn_idx];
+            debug_assert_eq!(len, pos0, "kv cache desync");
+            for r in 0..m {
+                let off = (len + r) * nkv * hd;
+                self.kv_k[attn_idx][off..off + k_row].copy_from_slice(&b.k[r * k_row..][..k_row]);
+                self.kv_v[attn_idx][off..off + v_row].copy_from_slice(&b.v[r * v_row..][..v_row]);
+            }
+            self.kv_len[attn_idx] = len + m;
+        }
+
+        // attention core: rows split between caller and worker bands; each
+        // band owns disjoint `out` rows (written via raw offset, joined
+        // before return — the same soundness argument as the kernel bands)
+        // and its own softmax scratch.
+        {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let swa = if self.is_swa[il] { Some(self.swa_window) } else { None };
+            let kcache = &self.kv_k[attn_idx];
+            let vcache = &self.kv_v[attn_idx];
+            let (q, g, out) = (&b.q[..m * n_e], &b.gate_h[..m * nh], &mut b.attn[..m * n_e]);
+            out.iter_mut().for_each(|v| *v = 0.0);
+            let out_ptr = out.as_mut_ptr();
+            let ta0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            if m >= 2 {
+                let mid = row_split(m);
+                let (s1, s2) = (&mut b.scores, &mut b.scores2);
+                let lo = move || unsafe {
+                    attn_rows_lfm3(q, g, out_ptr, kcache, vcache, 0, mid, pos0,
+                        n_e, nh, nkv, hd, rep, swa, scale, s1);
+                };
+                let hi = move || unsafe {
+                    attn_rows_lfm3(q, g, out_ptr, kcache, vcache, mid, m, pos0,
+                        n_e, nh, nkv, hd, rep, swa, scale, s2);
+                };
+                par_chunks2(lo, hi);
+            } else {
+                let mut s = std::mem::take(&mut b.scores);
+                unsafe {
+                    attn_rows_lfm3(q, g, out_ptr, kcache, vcache, 0, m, pos0,
+                        n_e, nh, nkv, hd, rep, swa, scale, &mut s);
+                }
+                b.scores = s;
+            }
+            if prof::prof_enabled() {
+                prof::record(pbucket("attn_core(batch)"), ta0, 0);
+            }
+        }
+
+        // output projection GEMM → mixer output rows (b.branch)
+        {
+            let o_name = format!("blk.{il}.attn_output.weight");
+            let (gguf, packed) = (&self.gguf, &self.packed);
+            let (attn, branch) = (&b.attn[..m * n_e], &mut b.branch[..m * n_e]);
+            pgemm(gguf, packed, &o_name, attn, m, nt, branch);
+        }
+    }
+
+    /// Batched shortconv layer: in_proj GEMM (M×3n_e), per-token b/c/x with
+    /// bx = b⊙x, causal convolution over [state | M new values] with the
+    /// 7-tap kernel, state roll-forward, out_proj GEMM → mixer output rows.
+    fn shortconv_block_batch(&mut self, il: usize, recr_idx: usize, m: usize, b: &mut Lfm3Batch) {
+        use llama_kernels::pool::par_chunks2;
+        let n_e = self.n_embd;
+        let taps = self.l_cache;      // 7
+        let d_conv = self.d_conv;     // 6
+        let nt = self.n_threads;
+
+        // in_proj GEMM
+        {
+            let in_name = format!("blk.{il}.shortconv.in_proj.weight");
+            let (gguf, packed, h) = (&self.gguf, &self.packed, &b.h[..m * n_e]);
+            let out = &mut b.in_proj[..m * 3 * n_e];
+            pgemm(gguf, packed, &in_name, h, m, nt, out);
+        }
+
+        // build the channel-major window [ch][d_conv + M]: old state, then
+        // this batch's bx values (b·x per row)
+        {
+            let state = &self.conv_state[recr_idx];
+            let inproj = &b.in_proj[..m * 3 * n_e];
+            let conv_w = &mut b.conv_w;
+            let span = d_conv + m;
+            for ch in 0..n_e {
+                let wrow = &mut conv_w[ch * span..(ch + 1) * span];
+                for k in 0..d_conv {
+                    wrow[k] = state[ch * d_conv + k];
+                }
+                for r in 0..m {
+                    let bcx = &inproj[r * 3 * n_e..][..3 * n_e];
+                    let (bch, cch, xch) = (&bcx[..n_e], &bcx[n_e..2 * n_e], &bcx[2 * n_e..]);
+                    wrow[d_conv + r] = bch[ch] * xch[ch];
+                    // (c is consumed below; re-read for clarity of the row split)
+                    let _ = cch;
+                }
+            }
+        }
+
+        // convolution: y[r][ch] = c[r][ch] · Σ_j ker[ch][j] · W[ch][r+j]
+        {
+            let kernel = &self.conv_kernels[recr_idx];
+            let span = d_conv + m;
+            let inproj = &b.in_proj[..m * 3 * n_e];
+            let conv_w = &b.conv_w;
+            let y = &mut b.conv_y[..m * n_e];
+            let conv_row = |r_lo: usize, r_hi: usize, y_out: *mut f32| unsafe {
+                for r in r_lo..r_hi {
+                    let bcx = &inproj[r * 3 * n_e..][..3 * n_e];
+                    let cch = &bcx[n_e..2 * n_e];
+                    for ch in 0..n_e {
+                        let wrow = &conv_w[ch * span..(ch + 1) * span];
+                        let mut acc = 0f32;
+                        for j in 0..taps {
+                            acc += kernel[ch * taps + j] * wrow[r + j];
+                        }
+                        *y_out.add(r * n_e + ch) = cch[ch] * acc;
+                    }
+                }
+            };
+            if m >= 2 {
+                let mid = row_split(m);
+                let y_ptr = y.as_mut_ptr();
+                let lo = move || conv_row(0, mid, y_ptr);
+                let hi = move || conv_row(mid, m, y_ptr);
+                par_chunks2(lo, hi);
+            } else {
+                let y_ptr = y.as_mut_ptr();
+                conv_row(0, m, y_ptr);
+            }
+        }
+
+        // roll the conv state forward: state[ch][k] = W[ch][m + k]
+        {
+            let span = d_conv + m;
+            let conv_w = &b.conv_w;
+            let state = &mut self.conv_state[recr_idx];
+            for ch in 0..n_e {
+                let wrow = &conv_w[ch * span..(ch + 1) * span];
+                for k in 0..d_conv {
+                    state[ch * d_conv + k] = wrow[m + k];
+                }
+            }
+        }
+
+        // out_proj GEMM → mixer output rows (b.branch)
+        {
+            let out_name = format!("blk.{il}.shortconv.out_proj.weight");
+            let (gguf, packed) = (&self.gguf, &self.packed);
+            let (conv_y, branch) = (&b.conv_y[..m * n_e], &mut b.branch[..m * n_e]);
+            pgemm(gguf, packed, &out_name, conv_y, m, nt, branch);
+        }
+    }
+}
+
+/// One row's q/k norm + rope heads (LFM3): q is n_e = nh·hd, k is nkv·hd,
+/// `pos` is the row's absolute position.
+#[allow(clippy::too_many_arguments)]
+fn qk_norm_rope_row(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    w_q: &[f32],
+    w_k: &[f32],
+    eps: f32,
+    is_swa: bool,
+    base_full: f64,
+    base_swa: f64,
+    freqs: Option<&[f32]>,
+) {
+    let hd = w_q.len();
+    let nh = q.len() / hd;
+    let nkv = k.len() / hd;
+    for hq in 0..nh {
+        let head = &mut q[hq * hd..(hq + 1) * hd];
+        rmsnorm_inplace(head, w_q, eps);
+        if !is_swa {
+            rope_neox_inplace(head, pos, base_full, freqs);
+        } else {
+            rope_neox_inplace(head, pos, base_swa, None);
+        }
+    }
+    for hk in 0..nkv {
+        let head = &mut k[hk * hd..(hk + 1) * hd];
+        rmsnorm_inplace(head, w_k, eps);
+        if !is_swa {
+            rope_neox_inplace(head, pos, base_full, freqs);
+        } else {
+            rope_neox_inplace(head, pos, base_swa, None);
+        }
+    }
+}
+
+/// Band of LFM3 batched attention rows [r_lo, r_hi): for every (row, head)
+/// the causal/SWA scores against the kv cache rows of the GQA group,
+/// vectorized softmax, weighted value accumulation and the head gate.
+/// `out` rows are written at `out + r*n_e` (disjoint per band).
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_rows_lfm3(
+    q: &[f32],
+    g: &[f32],
+    out: *mut f32,
+    kcache: &[f32],
+    vcache: &[f32],
+    r_lo: usize,
+    r_hi: usize,
+    pos0: usize,
+    n_e: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rep: usize,
+    swa: Option<usize>,
+    scale: f32,
+    scores: &mut Vec<f32>,
+) {
+    use llama_kernels::batch as bf;
+    for r in r_lo..r_hi {
+        for hq in 0..nh {
+            let kvh = hq / rep;
+            let n_kv = pos0 + r + 1;
+            let lo = swa.map(|w| (pos0 + r).saturating_sub(w - 1)).unwrap_or(0);
+            let qs = &q[r * n_e + hq * hd..][..hd];
+            scores.clear();
+            for p in lo..n_kv {
+                let k = &kcache[p * nkv * hd + kvh * hd..][..hd];
+                scores.push(bf::dot_f32(qs, k) * scale);
+            }
+            bf::softmax_inplace_f32(scores);
+            let orow = std::slice::from_raw_parts_mut(out.add(r * n_e + hq * hd), hd);
+            for (wgt, p) in scores.iter().zip(lo..n_kv) {
+                let v = &vcache[p * nkv * hd + kvh * hd..][..hd];
+                bf::axpy_f32(*wgt, v, orow);
+            }
+            let g0 = g[r * nh + hq];
+            for v in orow.iter_mut() {
+                *v *= g0;
+            }
+        }
+    }
 }
 
 /// One attention head reading the rows of a given kv head from [n_kv][nkv*hd] buffers
@@ -562,6 +1250,45 @@ pub struct LlamaFamily {
     b_q: Vec<Option<Vec<f32>>>,
     b_k: Vec<Option<Vec<f32>>>,
     b_v: Vec<Option<Vec<f32>>>,
+    /// Phase 6.5: reusable batched-prefill buffers
+    b: Option<Box<LlamaBatch>>,
+}
+
+/// Reusable activation arena for llama-family batched prefill.
+struct LlamaBatch {
+    x: Vec<f32>,       // M × n_e
+    h: Vec<f32>,       // M × n_e
+    q: Vec<f32>,       // M × n_e
+    k: Vec<f32>,       // M × nkv·hd
+    v: Vec<f32>,       // M × nkv·hd
+    attn: Vec<f32>,     // M × n_e
+    ffn_h: Vec<f32>,    // M × n_e
+    gate: Vec<f32>,     // M × n_ff
+    up: Vec<f32>,       // M × n_ff
+    ffni: Vec<f32>,     // M × n_ff
+    ffn_out: Vec<f32>,  // M × n_e
+    scores: Vec<f32>,
+    scores2: Vec<f32>,
+}
+
+impl LlamaBatch {
+    fn new(m_max: usize, n_e: usize, n_ff: usize, nkv: usize, hd: usize, n_ctx: usize) -> LlamaBatch {
+        LlamaBatch {
+            x: vec![0f32; m_max * n_e],
+            h: vec![0f32; m_max * n_e],
+            q: vec![0f32; m_max * n_e],
+            k: vec![0f32; m_max * nkv * hd],
+            v: vec![0f32; m_max * nkv * hd],
+            attn: vec![0f32; m_max * n_e],
+            ffn_h: vec![0f32; m_max * n_e],
+            gate: vec![0f32; m_max * n_ff],
+            up: vec![0f32; m_max * n_ff],
+            ffni: vec![0f32; m_max * n_ff],
+            ffn_out: vec![0f32; m_max * n_e],
+            scores: vec![0f32; n_ctx],
+            scores2: vec![0f32; n_ctx],
+        }
+    }
 }
 
 impl LlamaFamily {
@@ -608,6 +1335,7 @@ impl LlamaFamily {
             logits: vec![],
             w_attn_norm, w_ffn_norm, w_output_norm,
             b_q, b_k, b_v,
+            b: None,
             gguf,
         }
     }
@@ -682,6 +1410,7 @@ impl LlamaFamily {
                 prof::record(pbucket("attn_core"), ta0, 0);
                 prof::note_alloc(pbucket("attn_core"), self.head_dim * 4);
             }
+
             let o_name = format!("blk.{il}.attn_output.weight");
             let mut attn_out = vec![0f32; n_e];
             pmv(&self.gguf, &self.packed, &o_name, &self.s_attn, &mut attn_out, self.n_threads);
@@ -698,15 +1427,31 @@ impl LlamaFamily {
             // available, AVX2 matvec2 otherwise
             let gate_name = format!("blk.{il}.ffn_gate.weight");
             let up_name = format!("blk.{il}.ffn_up.weight");
-            let down = W::get(&self.gguf, &format!("blk.{il}.ffn_down.weight"));
+            let down_name = format!("blk.{il}.ffn_down.weight");
             pmv2(&self.gguf, &self.packed, &gate_name, &up_name, &h2, &mut self.s_gate, &mut self.s_up, self.n_threads);
-            let ffn_out = swiglu_ffn(&down, &self.s_gate, &self.s_up, &mut self.s_ffn, self.n_threads);
+            // swiglu elementwise, then ffn_down through the packed pmv dispatch
+            // (Phase 6.5 fix: ffn_down previously fell back to the AVX2 matvec
+            // — the same architectural hole Phase 6.4 closed for LFM3; now
+            // every matmul of both architectures goes through pmv/pmv2)
+            let tw0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            let n_ff = self.s_gate.len();
+            for i in 0..n_ff {
+                self.s_ffn[i] = silu(self.s_gate[i]) * self.s_up[i];
+            }
+            if prof::prof_enabled() {
+                prof::record(prof::bucket("swiglu(elementwise)"), tw0, 0);
+            }
+            let mut ffn_out = vec![0f32; n_e];
+            pmv(&self.gguf, &self.packed, &down_name, &self.s_ffn, &mut ffn_out, self.n_threads);
+
             let te1 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             for i in 0..n_e { x[i] += ffn_out[i]; }
             if prof::prof_enabled() {
                 prof::record(pbucket("elementwise"), te1, 0);
             }
+
         }
+
 
         let xn = rmsnorm(&x, &self.w_output_norm, self.eps);
         let out_w_name = if self.gguf.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
@@ -725,9 +1470,293 @@ impl LlamaFamily {
         for l in self.kv_len.iter_mut() { *l = 0; }
         self.pos = 0;
     }
+
+    /// Batched prefill (see Lfm3::prefill): chunks at LLAMA_RS_PREFILL_M,
+    /// M=1 routes through `forward` (decode path, unchanged numerics).
+    pub fn prefill(&mut self, tokens: &[u32]) -> &[f32] {
+        let max_m = prefill_batch_max();
+        if tokens.is_empty() {
+            return &self.logits;
+        }
+        if max_m == 1 || tokens.len() == 1 {
+            for &t in tokens {
+                self.forward(t);
+            }
+            return &self.logits;
+        }
+        for chunk in tokens.chunks(max_m) {
+            self.forward_batch(chunk);
+        }
+        &self.logits
+    }
+
+    /// One batched forward over M tokens: q/k/v GEMMs (+ qwen biases), neox
+    /// rope per row, M KV appends, causal GQA attention, out_proj GEMM, FFN
+    /// GEMMs; logits = last row's output head.
+    pub fn forward_batch(&mut self, tokens: &[u32]) -> &[f32] {
+        use llama_kernels::pool::par_chunks2;
+        let m = tokens.len();
+        debug_assert!(m >= 1);
+        debug_assert!(m <= prefill_batch_max(), "call prefill() to chunk");
+        let n_e = self.n_embd;
+        let hd = self.head_dim;
+        let nh = self.n_head;
+        let nkv = self.n_head_kv;
+        let (k_row, v_row) = (nkv * hd, nkv * hd);
+        let pos0 = self.pos;
+        let eps = self.eps;
+        let nt = self.n_threads;
+
+        if self.b.is_none() {
+            self.b = Some(Box::new(LlamaBatch::new(
+                prefill_batch_max(), n_e, self.n_ff, nkv, hd, self.n_ctx,
+            )));
+        }
+        let mut b = self.b.take().unwrap();
+
+        // embedding rows
+        {
+            let tok_emb = W::get(&self.gguf, "token_embd.weight");
+            for (t, row) in tokens.iter().zip(b.x.chunks_exact_mut(n_e)) {
+                let col = tok_emb.column(*t as usize, n_e);
+                row.copy_from_slice(&col);
+            }
+        }
+
+        for il in 0..self.n_layer {
+            // attn_norm rows
+            {
+                let w = &self.w_attn_norm[il];
+                for r in 0..m {
+                    rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.h[r * n_e..][..n_e]);
+                }
+            }
+            // q/k/v GEMMs (shared quantization per type)
+            {
+                let (gguf, packed, h) = (&self.gguf, &self.packed, &b.h[..m * n_e]);
+                let q_name = format!("blk.{il}.attn_q.weight");
+                let k_name = format!("blk.{il}.attn_k.weight");
+                let v_name = format!("blk.{il}.attn_v.weight");
+                let names = [q_name.as_str(), k_name.as_str(), v_name.as_str()];
+                let mut outs: [&mut [f32]; 3] = [
+                    &mut b.q[..m * n_e],
+                    &mut b.k[..m * k_row],
+                    &mut b.v[..m * v_row],
+                ];
+                pgemm_shared(gguf, packed, &names, h, m, nt, &mut outs);
+            }
+            // biases per row
+            if let Some(bq) = &self.b_q[il] {
+                for r in 0..m {
+                    for i in 0..n_e { b.q[r * n_e + i] += bq[i]; }
+                }
+            }
+            if let Some(bk) = &self.b_k[il] {
+                for r in 0..m {
+                    for i in 0..k_row { b.k[r * k_row + i] += bk[i]; }
+                }
+            }
+            if let Some(bv) = &self.b_v[il] {
+                for r in 0..m {
+                    for i in 0..v_row { b.v[r * v_row + i] += bv[i]; }
+                }
+            }
+            // neox rope per row/head
+            {
+                let rope_base = self.rope_base;
+                let (q, k) = (&mut b.q[..m * n_e], &mut b.k[..m * k_row]);
+                if m >= 2 {
+                    let mid = row_split(m);
+                    let (q_lo, q_hi) = q.split_at_mut(mid * n_e);
+                    let (k_lo, k_hi) = k.split_at_mut(mid * k_row);
+                    let lo = move || {
+                        for r in 0..mid {
+                            rope_row(&mut q_lo[r * n_e..][..n_e], &mut k_lo[r * k_row..][..k_row], pos0 + r, hd, rope_base);
+                        }
+                    };
+                    let hi = move || {
+                        for r in 0..(m - mid) {
+                            rope_row(&mut q_hi[r * n_e..][..n_e], &mut k_hi[r * k_row..][..k_row], pos0 + mid + r, hd, rope_base);
+                        }
+                    };
+                    par_chunks2(lo, hi);
+                } else {
+                    for r in 0..m {
+                        rope_row(&mut b.q[r * n_e..][..n_e], &mut b.k[r * k_row..][..k_row], pos0 + r, hd, rope_base);
+                    }
+                }
+            }
+            // KV append
+            {
+                let len = self.kv_len[il];
+                debug_assert_eq!(len, pos0, "kv cache desync");
+                for r in 0..m {
+                    let off = (len + r) * nkv * hd;
+                    self.kv_k[il][off..off + k_row].copy_from_slice(&b.k[r * k_row..][..k_row]);
+                    self.kv_v[il][off..off + v_row].copy_from_slice(&b.v[r * v_row..][..v_row]);
+                }
+                self.kv_len[il] = len + m;
+            }
+            // causal GQA attention (rows split between threads)
+            {
+                let scale = 1.0 / (hd as f32).sqrt();
+                let rep = nh / nkv;
+                let kcache = &self.kv_k[il];
+                let vcache = &self.kv_v[il];
+                let (q, out) = (&b.q[..m * n_e], &mut b.attn[..m * n_e]);
+                out.iter_mut().for_each(|v| *v = 0.0);
+                let out_ptr = out.as_mut_ptr();
+                let ta0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+                if m >= 2 {
+                    let mid = row_split(m);
+                    let (s1, s2) = (&mut b.scores, &mut b.scores2);
+                    let lo = move || unsafe {
+                        attn_rows_causal(q, out_ptr, kcache, vcache, 0, mid, pos0,
+                            n_e, nh, nkv, hd, rep, scale, s1);
+                    };
+                    let hi = move || unsafe {
+                        attn_rows_causal(q, out_ptr, kcache, vcache, mid, m, pos0,
+                            n_e, nh, nkv, hd, rep, scale, s2);
+                    };
+                    par_chunks2(lo, hi);
+                } else {
+                    let mut s = std::mem::take(&mut b.scores);
+                    unsafe {
+                        attn_rows_causal(q, out_ptr, kcache, vcache, 0, m, pos0,
+                            n_e, nh, nkv, hd, rep, scale, &mut s);
+                    }
+                    b.scores = s;
+                }
+                if prof::prof_enabled() {
+                    prof::record(pbucket("attn_core(batch)"), ta0, 0);
+                }
+
+            }
+            // out_proj GEMM + residual
+            {
+                let o_name = format!("blk.{il}.attn_output.weight");
+                let (gguf, packed) = (&self.gguf, &self.packed);
+                let (attn, x) = (&b.attn[..m * n_e], &mut b.x[..m * n_e]);
+                pgemm(gguf, packed, &o_name, attn, m, nt, &mut b.ffn_out[..m * n_e]);
+                for r in 0..m {
+                    let (xr, fr) = (&mut x[r * n_e..][..n_e], &b.ffn_out[r * n_e..][..n_e]);
+                    for i in 0..n_e { xr[i] += fr[i]; }
+                }
+            }
+            // FFN: norm rows, fused gate/up GEMM, swiglu rows, down GEMM
+            {
+                let w = &self.w_ffn_norm[il];
+                for r in 0..m {
+                    rmsnorm_into(&b.x[r * n_e..][..n_e], w, eps, &mut b.ffn_h[r * n_e..][..n_e]);
+                }
+            }
+            {
+                let gate_name = format!("blk.{il}.ffn_gate.weight");
+                let up_name = format!("blk.{il}.ffn_up.weight");
+                let (gguf, packed, ffn_h) = (&self.gguf, &self.packed, &b.ffn_h[..m * n_e]);
+                let (gate, up) = (&mut b.gate[..m * self.n_ff], &mut b.up[..m * self.n_ff]);
+                pgemm2(gguf, packed, &gate_name, &up_name, ffn_h, m, nt, gate, up);
+            }
+            {
+                let (g, u, f) = (&b.gate[..m * self.n_ff], &b.up[..m * self.n_ff], &mut b.ffni[..m * self.n_ff]);
+                let n_ff = self.n_ff;
+                for r in 0..m {
+                    let (gr, ur, fr) = (&g[r * n_ff..][..n_ff], &u[r * n_ff..][..n_ff], &mut f[r * n_ff..][..n_ff]);
+                    for i in 0..n_ff { fr[i] = silu(gr[i]) * ur[i]; }
+                }
+            }
+            {
+                let down_name = format!("blk.{il}.ffn_down.weight");
+                let (gguf, packed, ffni) = (&self.gguf, &self.packed, &b.ffni[..m * self.n_ff]);
+                let ffn_out = &mut b.ffn_out[..m * n_e];
+                pgemm(gguf, packed, &down_name, ffni, m, nt, ffn_out);
+
+            }
+            {
+                let (x, fo) = (&mut b.x[..m * n_e], &b.ffn_out[..m * n_e]);
+                for r in 0..m {
+                    let (xr, fr) = (&mut x[r * n_e..][..n_e], &fo[r * n_e..][..n_e]);
+                    for i in 0..n_e { xr[i] += fr[i]; }
+                }
+            }
+
+        }
+
+        // output head (last row only)
+        {
+            let last = &b.x[(m - 1) * n_e..][..n_e];
+            let xn = rmsnorm(last, &self.w_output_norm, eps);
+            let out_w_name = if self.gguf.tensor("output.weight").is_some() { "output.weight" } else { "token_embd.weight" };
+            if self.logits.len() != self.gguf.tensor(out_w_name).unwrap().dims[1] as usize {
+                self.logits = vec![0f32; self.gguf.tensor(out_w_name).unwrap().dims[1] as usize];
+            }
+            let (gguf, packed) = (&self.gguf, &self.packed);
+            let logits = &mut self.logits;
+            pmv(gguf, packed, out_w_name, &xn, logits, nt);
+        }
+
+        self.pos += m;
+        self.b = Some(b);
+        &self.logits
+    }
+}
+
+/// One row's neox rope over all q heads and k heads (head_dim `hd`).
+fn rope_row(q: &mut [f32], k: &mut [f32], pos: usize, hd: usize, base: f64) {
+    let nh = q.len() / hd;
+    let nkv = k.len() / hd;
+    for hq in 0..nh {
+        let head = &mut q[hq * hd..(hq + 1) * hd];
+        rope_neox_inplace(head, pos, base, None);
+    }
+    for hk in 0..nkv {
+        let head = &mut k[hk * hd..(hk + 1) * hd];
+        rope_neox_inplace(head, pos, base, None);
+    }
+}
+
+/// Band of causal llama-family attention rows [r_lo, r_hi): full causal
+/// (query at pos0+r attends keys 0..=pos0+r), GQA over rep q-heads per kv head.
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_rows_causal(
+    q: &[f32],
+    out: *mut f32,
+    kcache: &[f32],
+    vcache: &[f32],
+    r_lo: usize,
+    r_hi: usize,
+    pos0: usize,
+    n_e: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rep: usize,
+    scale: f32,
+    scores: &mut Vec<f32>,
+) {
+    use llama_kernels::batch as bf;
+    for r in r_lo..r_hi {
+        for hq in 0..nh {
+            let kvh = hq / rep;
+            let n_kv = pos0 + r + 1;
+            let qs = &q[r * n_e + hq * hd..][..hd];
+            scores.clear();
+            for p in 0..n_kv {
+                let k = &kcache[p * nkv * hd + kvh * hd..][..hd];
+                scores.push(bf::dot_f32(qs, k) * scale);
+            }
+            bf::softmax_inplace_f32(scores);
+            let orow = std::slice::from_raw_parts_mut(out.add(r * n_e + hq * hd), hd);
+            for (wgt, p) in scores.iter().zip(0..n_kv) {
+                let v = &vcache[p * nkv * hd + kvh * hd..][..hd];
+                bf::axpy_f32(*wgt, v, orow);
+            }
+        }
+    }
 }
 
 // imports (aggregated)
-use crate::{W, weights1d, rmsnorm, rope_neox_inplace, softmax_inplace, swiglu_ffn, sigmoid, silu};
+use crate::{W, weights1d, rmsnorm, rmsnorm_into, rmsnorm_inplace, rope_neox_inplace,
+    softmax_inplace, sigmoid, silu};
 #[allow(unused_imports)]
 use Value as _;

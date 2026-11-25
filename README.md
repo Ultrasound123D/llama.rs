@@ -1,8 +1,8 @@
 # llama.rs — a native Rust port of the llama.cpp engine (b12502)
 
-A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage**, output-compatible with llama.cpp — proven by automated parity tests (16/16 passing).
+A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage**, output-compatible with llama.cpp — proven by automated parity tests (24/24 passing).
 
-## Status (v0.2 — Phases 0–6 complete)
+## Status (v0.2 — Phases 0–6.5 complete)
 
 | Feature | Status | Evidence |
 |---|---|---|
@@ -13,8 +13,11 @@ A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage*
 | BPE tokenizer (llama3-pre + ignore_merges + byte-encode + merges + special fragmentation) | ✅ | 10/10 tokenize checks (5 texts × 2 models: mixed-script/English/symbols) = 100% identical ids |
 | LFM3 chat template (thinking tags extracted from the raw template) + ChatML | ✅ | chat mode works on both models |
 | Sampling: greedy/temp/top-k/top-p | ✅ | — |
-| CLI: generate/chat/tokenize/bench/debug | ✅ | — |
+| CLI: generate/chat/tokenize/bench/debug/batchcmp/mem | ✅ | — |
 | **Phase 6 SIMD kernels** (int8-domain AVX2+VNNI vec_dots, activation quantizers, persistent worker pool) | ✅ | LFM3-1.7B: **0.9 → 12.0 tok/s (~13×)** on this 2-vCPU VM; parity 16/16 still green |
+| **Phase 6.3–6.4 packed VNNI decode path** (load-time repack of Q8_0/Q5_0/Q4_K/Q6_K) | ✅ | LFM3 decode at **101–102 % of llama.cpp** (30-rep campaign, median [P10 P90]) |
+| **Phase 6.5 batched prefill (M>1 packed GEMM)** | ✅ | LFM3 pp **12 → 54 tok/s (4.5×)**; **Qwen pp at 102 % of llama.cpp** (154.7 vs 152.0); Qwen pp512 sweep M∈{1,8,32,128,512}; parity 24/24 |
+| **Phase 6.5 memory reclaim** (madvise of repacked originals) | ✅ | LFM3 peak RSS **2050 → 1227 MB**; Qwen **1079 → 706 MB** steady / 724 peak |
 
 ## Build & run
 
@@ -30,17 +33,33 @@ cargo build --release
 # Tokenize
 ./target/release/llama-rs-cli -m model.gguf --mode tokenize --no-bos -p "some text"
 
-# Benchmark
+# Benchmark (batched prefill + decode, with RSS report)
 ./target/release/llama-rs-cli -m model.gguf --mode bench -p "warm" -n 16 -t 2
+
+# Batched-prefill self-check (token-at-a-time vs batched logits + top-1)
+./target/release/llama-rs-cli -m model.gguf --mode batchcmp -p "The capital of France is" -t 2
+
+# Memory study (RSS / peak RSS at load → prefill → decode)
+./target/release/llama-rs-cli -m model.gguf --mode mem -p "warm" -t 2
 ```
+
+### Knobs (A/B switches, same binary)
+
+- `LLAMA_RS_PREFILL_M` — batched-prefill chunk size (default 512; `1` = token-at-a-time)
+- `LLAMA_RS_MEM_KEEP=1` — keep the original tensor bytes resident (disable the madvise reclaim)
+- `LLAMA_RS_VNNI=0` — disable the packed VNNI path (AVX2 fallback everywhere)
+- `LLAMA_RS_SLOT=0` / `LLAMA_RS_SPLIT` — dispatch-path and band-split knobs
+- `LLAMA_RS_PROF=1` — op-level TSC profile; `LLAMA_RS_PROF_PP=1` — prefill-phase profile (bench mode)
 
 ## Parity tests (llama.cpp as golden reference)
 
 ```bash
 bash tests/parity/run_parity.sh
-# Current result: PASS=16 FAIL=0
+# Current result: PASS=24 FAIL=0
 #  - tokenization ×10 (mixed-script/English/digits/symbols texts, on both models)
 #  - top-1 greedy after prefill ×4 (includes the hybrid LFM3)
+#  - batched-prefill gates ×8 (Phase 6.5): batched top-1 == token-at-a-time top-1,
+#    and the batchcmp logits self-check, on both models × 2 prompts
 #  - dequantization ×2: Q5_0 and Q6_K against direct ggml C code (ground truth)
 ```
 

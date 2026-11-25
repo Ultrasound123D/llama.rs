@@ -1,5 +1,5 @@
 //! llama-rs-cli — command-line interface for the engine
-//! modes: generate | chat | tokenize | bench
+//! modes: generate | chat | tokenize | bench | batchcmp | mem
 use llama_core::model::{Lfm3, LlamaFamily};
 use llama_core::tokenizer::BpeTokenizer;
 use llama_core::sampler::{sample, SamplerCfg, SimpleRng};
@@ -11,6 +11,42 @@ use std::io::Write;
 enum Model {
     Lfm3(Lfm3),
     Llama(LlamaFamily),
+}
+
+/// Batched prefill (Phase 6.5) — routes M=1 chunks through the decode path.
+fn prefill_model(model: &mut Model, ids: &[u32]) -> Vec<f32> {
+    let l = match model {
+        Model::Lfm3(m) => m.prefill(ids),
+        Model::Llama(m) => m.prefill(ids),
+    };
+    l.to_vec()
+}
+
+fn reset_model(model: &mut Model) {
+    match model {
+        Model::Lfm3(m) => m.reset(),
+        Model::Llama(m) => m.reset(),
+    }
+}
+
+/// (VmRSS, VmHWM) in KB from /proc/self/status
+fn read_rss() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut rss = 0u64;
+    let mut hwm = 0u64;
+    for line in s.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            rss = v.trim().split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("VmHWM:") {
+            hwm = v.trim().split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        }
+    }
+    (rss, hwm)
+}
+
+fn rss_line(tag: &str) {
+    let (rss, hwm) = read_rss();
+    eprintln!("[llama.rs] rss {tag}: VmRSS={:.1} MB VmHWM={:.1} MB", rss as f64 / 1024.0, hwm as f64 / 1024.0);
 }
 
 fn main() {
@@ -91,27 +127,57 @@ fn main() {
         }
         "debug" => {
             let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
-            // prefill, then print the top-5
-            let mut logits: Vec<f32>;
-            {
-                let l = forward_token(&mut model, ids[0]);
-                logits = l.to_vec();
-            }
-            for &id in &ids[1..] {
-                let l = forward_token(&mut model, id);
-                logits = l.to_vec();
-            }
+            // batched prefill (Phase 6.5), then print the top-5 — the same
+            // debug output the parity script greps (top1 unchanged)
+            let logits = prefill_model(&mut model, &ids);
             let mut idx: Vec<usize> = (0..logits.len()).collect();
             idx.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
             for (r, i) in idx.iter().take(5).enumerate() {
                 println!("top{}: id={} logit={:.4} text={:?}", r + 1, i, logits[*i], tokenizer.detokenize_one(*i as u32));
             }
         }
+        "batchcmp" => {
+            // batched-prefill self-check: token-by-token (decode path) vs
+            // batched prefill logits + greedy agreement on the real model
+            let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
+            std::env::set_var("LLAMA_RS_PREFILL_M", "1");
+            let ref_logits = prefill_model(&mut model, &ids);
+            reset_model(&mut model);
+            std::env::set_var("LLAMA_RS_PREFILL_M", "512");
+            let batch_logits = prefill_model(&mut model, &ids);
+            let mut max_d = 0f64;
+            let mut max_rel = 0f64;
+            let top = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap();
+            let (t1, t2) = (top(&ref_logits), top(&batch_logits));
+            for i in 0..ref_logits.len().min(batch_logits.len()) {
+                let d = (ref_logits[i] - batch_logits[i]).abs() as f64;
+                if d > max_d {
+                    max_d = d;
+                }
+                let r = d / (ref_logits[i].abs().max(1.0) as f64);
+                if r > max_rel {
+                    max_rel = r;
+                }
+            }
+            println!("batchcmp: tokens={} max|dlogit|={max_d:.6} max_rel={max_rel:.6} top1: ref={t1} batch={t2} {}", ids.len(), if t1 == t2 { "MATCH" } else { "DIFFER" });
+        }
+        "mem" => {
+            // memory study: RSS/peak at load → after batched prefill → after decode
+            let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
+            rss_line("after-load");
+            let _ = prefill_model(&mut model, &ids);
+            rss_line("after-prefill");
+            let _ = forward_token(&mut model, 1);
+            rss_line("after-1-decode");
+        }
         "bench" => {
             let ids = tokenizer.tokenize(&prompt, Some(!no_bos), false);
             let (n_tok, secs, pp_tok, pp_secs) = bench(&mut model, &tokenizer, &ids, n_gen);
-            println!("bench-pp: {pp_tok} prompt tokens in {pp_secs:.2}s = {:.2} tok/s (prefill)", pp_tok as f32 / pp_secs);
+            let m = llama_core::model::prefill_batch_max();
+            println!("bench-pp: {pp_tok} prompt tokens in {pp_secs:.2}s = {:.2} tok/s (prefill, batch M={m})", pp_tok as f32 / pp_secs);
             println!("bench: {n_tok} tokens in {secs:.2}s = {:.2} tok/s (decode)", n_tok as f32 / secs);
+            let (rss, hwm) = read_rss();
+            println!("rss: VmRSS={:.1} MB VmHWM={:.1} MB", rss as f64 / 1024.0, hwm as f64 / 1024.0);
             if prof::prof_enabled() {
                 print_kstats_summary(n_tok);
                 print!("{}", prof::report());
@@ -131,16 +197,8 @@ fn generate_stop(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize, t
     let mut out_ids = Vec::new();
     let mut text = String::new();
 
-    // prefill
-    let mut logits: Vec<f32>;
-    {
-        let l = forward_token(model, ids[0]);
-        logits = l.to_vec();
-    }
-    for &id in &ids[1..] {
-        let l = forward_token(model, id);
-        logits = l.to_vec();
-    }
+    // prefill — batched (Phase 6.5); M=1 falls back to the decode path
+    let mut logits = prefill_model(model, ids);
 
     let t_start = std::time::Instant::now();
     for _ in 0..n {
@@ -159,22 +217,27 @@ fn generate_stop(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize, t
 
 /// Bench one run: prefill is timed separately from decode (review gate —
 /// "measure prefill and decode separately"). Returns (decode_tokens,
-/// decode_secs, prefill_tokens, prefill_secs).
+/// decode_secs, prefill_tokens, prefill_secs). Prefill runs the Phase 6.5
+/// batched path (LLAMA_RS_PREFILL_M controls the batch size; =1 restores
+/// the token-at-a-time behavior for A/B).
 fn bench(model: &mut Model, tok: &BpeTokenizer, ids: &[u32], n: usize) -> (usize, f32, usize, f32) {
     // prefill, timed separately (includes first-touch page warmup of the
-    // weights; across N process repetitions the median absorbs the cold rep)
+    // weights; across N process repetitions the median absorbs the cold rep).
+    // LLAMA_RS_PROF_PP=1 profiles the prefill phase (op table + kstats).
+    let prof_pp = std::env::var("LLAMA_RS_PROF_PP").is_ok();
+    if prof_pp {
+        prof::reset();
+        llama_kernels::kstats::reset();
+    }
     let tp0 = std::time::Instant::now();
-    let mut logits: Vec<f32>;
-    {
-        let l = forward_token(model, ids[0]);
-        logits = l.to_vec();
-    }
-    for &id in &ids[1..] {
-        let l = forward_token(model, id);
-        logits = l.to_vec();
-    }
+    let mut logits = prefill_model(model, ids);
     let pp_secs = tp0.elapsed().as_secs_f32();
     let pp_tok = ids.len();
+    if prof_pp {
+        eprintln!("--- prefill profile ({} tokens) ---", pp_tok);
+        print_kstats_summary(pp_tok);
+        print!("{}", prof::report());
+    }
 
     let t0 = std::time::Instant::now();
     // separate prefill from decode in the profile: reset all counters now
