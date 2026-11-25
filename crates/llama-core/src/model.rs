@@ -137,6 +137,55 @@ fn pbucket(name: &str) -> &'static prof::Bucket {
     prof::bucket(name)
 }
 
+/// Fused triple dispatch (q/k/v): packed VNNI triple — one activation
+/// quantization, one band-split for the whole per-layer projection set
+/// (Phase 6.8 dispatch-granularity fix: three pool round-trips + three
+/// redundant quantizations of the same activation per layer were the
+/// Qwen attn-proj stage's 3.29 GB/s, §9.3). Falls back to three `pmv`
+/// calls whenever the three tensors do not share type/shape (or are not
+/// all packed) — the results are bit-identical either way.
+#[allow(clippy::too_many_arguments)]
+fn pmv3(
+    gguf: &GgufFile,
+    packed: &PackedMap,
+    name1: &str,
+    name2: &str,
+    name3: &str,
+    x: &[f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    n_threads: usize,
+) {
+    if let (Some(p1), Some(p2), Some(p3)) = (packed.get(name1), packed.get(name2), packed.get(name3)) {
+        if p1.ty == p2.ty && p1.ty == p3.ty && p1.n_in == p2.n_in && p1.n_in == p3.n_in
+            && p1.n_out == out1.len() && p2.n_out == out2.len() && p3.n_out == out3.len()
+        {
+            let t0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
+            llama_kernels::vnni::matvec3_vnni(
+                &p1.data, p1.ty, p1.n_out,
+                &p2.data, p2.ty, p2.n_out,
+                &p3.data, p3.ty, p3.n_out,
+                p1.n_in, x, n_threads, out1, out2, out3,
+            );
+            if prof::prof_enabled() {
+                // all three tensors under the name1 class row (the fused row)
+                let bytes = |n: &str| gguf.tensor(n).map(|t| gguf.tensor_bytes(t).len() as u64).unwrap_or(0);
+                if let Some(t) = gguf.tensor(name1) {
+                    let class = prof::tensor_class(name1);
+                    let b = prof::bucket(&format!("mv {class} {:?}", t.ty));
+                    b.bytes.fetch_add(bytes(name1) + bytes(name2) + bytes(name3), std::sync::atomic::Ordering::Relaxed);
+                    prof::record(b, t0, 0);
+                }
+            }
+            return;
+        }
+    }
+    pmv(gguf, packed, name1, x, out1, n_threads);
+    pmv(gguf, packed, name2, x, out2, n_threads);
+    pmv(gguf, packed, name3, x, out3, n_threads);
+}
+
 // ============ Phase 6.5: batched prefill (M>1 GEMM path) ============
 //
 // `forward_batch(tokens)` runs M tokens through one forward pass: every
@@ -584,9 +633,8 @@ impl Lfm3 {
         let q_name = format!("blk.{il}.attn_q.weight");
         let k_name = format!("blk.{il}.attn_k.weight");
         let v_name = format!("blk.{il}.attn_v.weight");
-        pmv(&self.gguf, &self.packed, &q_name, h, &mut self.s_q, self.n_threads);
-        pmv(&self.gguf, &self.packed, &k_name, h, &mut self.s_k, self.n_threads);
-        pmv(&self.gguf, &self.packed, &v_name, h, &mut self.s_v, self.n_threads);
+        pmv3(&self.gguf, &self.packed, &q_name, &k_name, &v_name, h,
+            &mut self.s_q, &mut self.s_k, &mut self.s_v, self.n_threads);
 
         // q/k norm per head (q heads: 16 × 128; k heads: 4 × 128)
         let tq0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
@@ -1356,9 +1404,8 @@ impl LlamaFamily {
             let q_name = format!("blk.{il}.attn_q.weight");
             let k_name = format!("blk.{il}.attn_k.weight");
             let v_name = format!("blk.{il}.attn_v.weight");
-            pmv(&self.gguf, &self.packed, &q_name, &h, &mut self.s_q, self.n_threads);
-            pmv(&self.gguf, &self.packed, &k_name, &h, &mut self.s_k, self.n_threads);
-            pmv(&self.gguf, &self.packed, &v_name, &h, &mut self.s_v, self.n_threads);
+            pmv3(&self.gguf, &self.packed, &q_name, &k_name, &v_name, &h,
+                &mut self.s_q, &mut self.s_k, &mut self.s_v, self.n_threads);
             let _ = (q_name, k_name, v_name);
             if let Some(b) = &self.b_q[il] { for i in 0..self.s_q.len() { self.s_q[i] += b[i]; } }
             if let Some(b) = &self.b_k[il] { for i in 0..self.s_k.len() { self.s_k[i] += b[i]; } }

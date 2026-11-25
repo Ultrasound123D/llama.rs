@@ -723,7 +723,7 @@ fn vnni_gemm_matches_matvec_all_types() {
             GgmlType::Q6_K => (make_q6_k(*n_in, *n_out, 0x7777_8888u64), 0x7777_8888u64),
             _ => unreachable!(),
         };
-        for m in [1usize, 2, 3, 8, 17, 64] {
+        for m in [1usize, 2, 3, 5, 6, 7, 8, 17, 64] {
             let x = make_x(m, *n_in, seed.wrapping_add(m as u64));
             gemm_case(*ty, &data, *n_in, *n_out, &x, m, 1, name);
             if m >= 3 {
@@ -771,6 +771,79 @@ fn vnni_gemm_fused_pair_matches_two_gems() {
         assert_eq!(o2[i].to_bits(), r2[i].to_bits(), "fused pair out2 mismatch @ {i}");
     }
     eprintln!("  fused GEMM pair (Q4_K 256 -> 32/48, M=9, 2t): bit-identical to two singles");
+}
+
+/// Phase 6.8 fused q/k/v triple: `matvec3_vnni` must be bit-identical to
+/// three separate `matvec_vnni` calls (one shared quantization — the
+/// quantizer is deterministic, so the shared q bytes equal the three
+/// per-call bytes). Covers single-band AND split-band dispatch (the big
+/// shapes exceed the small-tensor split threshold).
+#[test]
+fn vnni_matvec3_matches_three_singles() {
+    if !vnni::vnni_path_available() {
+        eprintln!("SKIP (no AVX512-VNNI)");
+        return;
+    }
+    let shapes: Vec<(&str, GgmlType, usize, usize, usize, usize)> = vec![
+        ("Q8_0 small", GgmlType::Q8_0, 64, 32, 32, 32),
+        ("Q8_0 wide", GgmlType::Q8_0, 2048, 64, 64, 96),
+        ("Q5_0 small", GgmlType::Q5_0, 64, 32, 32, 32),
+        ("Q5_0 qwen-attn", GgmlType::Q5_0, 896, 896, 896, 896),
+        ("Q4_K small", GgmlType::Q4_K, 256, 32, 32, 32),
+        ("Q4_K big (split)", GgmlType::Q4_K, 2048, 7680, 7680, 7680),
+        ("Q6_K small", GgmlType::Q6_K, 256, 32, 32, 32),
+        ("Q6_K ffn (split)", GgmlType::Q6_K, 4864, 896, 896, 896),
+    ];
+    for (name, ty, n_in, n1, n2, n3) in &shapes {
+        let mk = |n_out: usize, seed: u64| -> Vec<u8> {
+            match ty {
+                GgmlType::Q8_0 => make_q8_0(*n_in, n_out),
+                GgmlType::Q5_0 => make_q5_0(*n_in, n_out),
+                GgmlType::Q4_K => make_q4_k(*n_in, n_out, seed),
+                GgmlType::Q6_K => make_q6_k(*n_in, n_out, seed),
+                _ => unreachable!(),
+            }
+        };
+        let rp = |d: &[u8], n_out: usize| -> Vec<u8> {
+            match ty {
+                GgmlType::Q8_0 => vnni::repack_q8_0(d, *n_in, n_out),
+                GgmlType::Q5_0 => vnni::repack_q5_0(d, *n_in, n_out),
+                GgmlType::Q4_K => vnni::repack_q4_k(d, *n_in, n_out),
+                GgmlType::Q6_K => vnni::repack_q6_k(d, *n_in, n_out),
+                _ => unreachable!(),
+            }
+        };
+        let d1 = mk(*n1, 0x0101_0101u64);
+        let d2 = mk(*n2, 0x0202_0202u64);
+        let d3 = mk(*n3, 0x0303_0303u64);
+        let p1 = rp(&d1, *n1);
+        let p2 = rp(&d2, *n2);
+        let p3 = rp(&d3, *n3);
+        let x = make_x(1, *n_in, 0x0404_0404u64);
+        for threads in [1usize, 2] {
+            let mut o1 = vec![0f32; *n1];
+            let mut o2 = vec![0f32; *n2];
+            let mut o3 = vec![0f32; *n3];
+            vnni::matvec3_vnni(
+                &p1, *ty, *n1, &p2, *ty, *n2, &p3, *ty, *n3, *n_in, &x, threads,
+                &mut o1, &mut o2, &mut o3,
+            );
+            let mut r1 = vec![0f32; *n1];
+            let mut r2 = vec![0f32; *n2];
+            let mut r3 = vec![0f32; *n3];
+            vnni::matvec_vnni(&p1, *ty, *n_in, *n1, &x, 1, &mut r1);
+            vnni::matvec_vnni(&p2, *ty, *n_in, *n2, &x, 1, &mut r2);
+            vnni::matvec_vnni(&p3, *ty, *n_in, *n3, &x, 1, &mut r3);
+            let ok = o1.iter().zip(&r1).all(|(a, b)| a.to_bits() == b.to_bits())
+                && o2.iter().zip(&r2).all(|(a, b)| a.to_bits() == b.to_bits())
+                && o3.iter().zip(&r3).all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(
+                ok,
+                "{name}: matvec3 (threads={threads}) differs from three separate matvecs"
+            );
+            eprintln!("  {name}: threads={threads} — bit-identical to three matvecs");
+        }
+    }
 }
 
 #[test]

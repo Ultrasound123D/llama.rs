@@ -745,7 +745,7 @@ pub fn matvec_vnni(
             quant::quantize_row_q8_0(x, &mut *q);
             let ng = n_out / TILE_N;
             let n_threads = n_threads.max(1);
-            if n_threads <= 1 || ng < 2 {
+            if n_threads <= 1 || ng < 2 || packed.len() < split_min_bytes() {
                 let ptr = out.as_mut_ptr();
                 unsafe { vnni_band(packed, &*q, kb, 0, ng, ptr, true) };
             } else {
@@ -766,7 +766,7 @@ pub fn matvec_vnni(
             quant::quantize_row_q8_k(x, &mut *q);
             let ng = n_out / TILE_N;
             let n_threads = n_threads.max(1);
-            if n_threads <= 1 || ng < 2 {
+            if n_threads <= 1 || ng < 2 || packed.len() < split_min_bytes() {
                 let ptr = out.as_mut_ptr();
                 unsafe { kq_band(packed, ty, &*q, kb, 0, ng, ptr, true) };
             } else {
@@ -850,6 +850,151 @@ unsafe fn kq_band2(
     }
 }
 
+/// Band-split policy for small packed matvecs (Phase 6.8 dispatch work).
+/// The Phase 6.6 audit measured the per-matvec pool round-trip (slot
+/// publish + worker claim + caller spin-join) at ~40 µs — for a small
+/// tensor whose whole single-thread compute is ~2× shorter than that,
+/// splitting the matvec between caller and worker costs MORE than it
+/// saves (the Qwen attention-projection stage ran at 3.29 GB/s vs the
+/// 11-19 GB/s of the big tensors: §9.3's "dispatch granularity" term).
+/// Below this many packed bytes the matvec runs single-band on the caller
+/// (identical results — the band split is a scheduling choice, never a
+/// numeric one). Overridable with LLAMA_RS_SPLIT_MIN (bytes; 0 = always
+/// split, the previous behavior).
+fn split_min_bytes() -> usize {
+    static E: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *E.get_or_init(|| match std::env::var("LLAMA_RS_SPLIT_MIN") {
+        Ok(v) => v.parse().unwrap_or(0),
+        Err(_) => 1_500_000,
+    })
+}
+
+/// Band over three packed tensors (q/k/v): the concatenated group space
+/// [0, ng1+ng2+ng3); groups [0, ng1) → out1, [ng1, ng1+ng2) → out2, the
+/// rest → out3. The same `group_dot_any` per group — the per-tensor outputs
+/// are bit-identical to three separate `matvec_vnni` calls on the same
+/// quantized activation (the quantizer is deterministic, so one shared
+/// quantization produces exactly the bytes the three calls would each
+/// produce).
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn band3_any(
+    ty: GgmlType,
+    p1: &[u8], ng1: usize,
+    p2: &[u8], ng2: usize,
+    p3: &[u8],
+    q: &[u8], kb: usize,
+    g_lo: usize, g_hi: usize,
+    out1: *mut f32, out2: *mut f32, out3: *mut f32,
+    is_caller: bool,
+) {
+    let t0 = if kstats::enabled() { kstats::tsc() } else { 0 };
+    for g in g_lo..g_hi {
+        if g < ng1 {
+            let r = group_dot_any(ty, q, kb, p1, g);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), out1.add(g * TILE_N), TILE_N);
+        } else if g < ng1 + ng2 {
+            let g2 = g - ng1;
+            let r = group_dot_any(ty, q, kb, p2, g2);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), out2.add(g2 * TILE_N), TILE_N);
+        } else {
+            let g3 = g - ng1 - ng2;
+            let r = group_dot_any(ty, q, kb, p3, g3);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), out3.add(g3 * TILE_N), TILE_N);
+        }
+    }
+    if kstats::enabled() {
+        let dt = kstats::tsc().wrapping_sub(t0);
+        kstats::DOT_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        if is_caller {
+            kstats::CALLER_BAND_TICKS.fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Fused triple matvec (q/k/v projections): one activation quantization,
+/// one dispatch over the concatenated group space of the three packed
+/// tensors. All three must share `ty`/`n_in` (the attention q/k/v of both
+/// supported architectures do); otherwise the caller falls back to three
+/// `matvec_vnni` calls. Per-tensor outputs bit-identical to the separate
+/// calls (see `band3_any`).
+#[allow(clippy::too_many_arguments)]
+pub fn matvec3_vnni(
+    p1: &[u8], ty1: GgmlType, n_out1: usize,
+    p2: &[u8], ty2: GgmlType, n_out2: usize,
+    p3: &[u8], ty3: GgmlType, n_out3: usize,
+    n_in: usize,
+    x: &[f32],
+    n_threads: usize,
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+) {
+    debug_assert_eq!(out1.len(), n_out1);
+    debug_assert_eq!(out2.len(), n_out2);
+    debug_assert_eq!(out3.len(), n_out3);
+    if !(ty1 == ty2 && ty1 == ty3) {
+        matvec_vnni(p1, ty1, n_in, n_out1, x, n_threads, out1);
+        matvec_vnni(p2, ty2, n_in, n_out2, x, n_threads, out2);
+        matvec_vnni(p3, ty3, n_in, n_out3, x, n_threads, out3);
+        return;
+    }
+    let ty = ty1;
+    let prof = kstats::enabled();
+    let tw0 = if prof { kstats::tsc() } else { 0 };
+    if prof {
+        kstats::MATVECS.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+    }
+    let kb = match ty {
+        GgmlType::Q8_0 | GgmlType::Q5_0 => {
+            assert!(n_in % 32 == 0);
+            n_in / 32
+        }
+        GgmlType::Q4_K | GgmlType::Q6_K => {
+            assert!(n_in % QK_K == 0);
+            n_in / QK_K
+        }
+        other => unreachable!("packed VNNI triple does not support {other:?}"),
+    };
+    let mut q = take_q(match ty {
+        GgmlType::Q8_0 | GgmlType::Q5_0 => kb * 34,
+        _ => kb * 292,
+    });
+    if matches!(ty, GgmlType::Q4_K | GgmlType::Q6_K) {
+        quant::quantize_row_q8_k(x, &mut *q);
+    } else {
+        quant::quantize_row_q8_0(x, &mut *q);
+    }
+    let ng1 = n_out1 / TILE_N;
+    let ng2 = n_out2 / TILE_N;
+    let ng3 = n_out3 / TILE_N;
+    let ng = ng1 + ng2 + ng3;
+    let n_threads = n_threads.max(1);
+    let total_bytes = p1.len() + p2.len() + p3.len();
+    if n_threads <= 1 || ng < 2 || total_bytes < split_min_bytes() {
+        let o1 = out1.as_mut_ptr();
+        let o2 = out2.as_mut_ptr();
+        let o3 = out3.as_mut_ptr();
+        unsafe { band3_any(ty, p1, ng1, p2, ng2, p3, &*q, kb, 0, ng, o1, o2, o3, true) };
+    } else {
+        let g_mid = (ng / 2).clamp(1, ng - 1);
+        let o1 = out1.as_mut_ptr();
+        let o2 = out2.as_mut_ptr();
+        let o3 = out3.as_mut_ptr();
+        let qa: &[u8] = &*q;
+        let caller = move || unsafe {
+            band3_any(ty, p1, ng1, p2, ng2, p3, qa, kb, 0, g_mid, o1, o2, o3, true)
+        };
+        let worker = move || unsafe {
+            band3_any(ty, p1, ng1, p2, ng2, p3, qa, kb, g_mid, ng, o1, o2, o3, false)
+        };
+        pool::par_chunks2(caller, worker);
+    }
+    if prof {
+        kstats::MATVEC_WALL_TICKS.fetch_add(kstats::tsc().wrapping_sub(tw0), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Fused packed pair matvec (gate/up): one activation quantization, one
 /// dispatch. Both tensors must share `ty`/`n_in` (the gate/up pairs of the
 /// supported models do); a mixed-type pair is computed as two packed
@@ -902,7 +1047,7 @@ pub fn matvec2_vnni(
     let ng2 = n_out2 / TILE_N;
     let ng = ng1 + ng2;
     let n_threads = n_threads.max(1);
-    if n_threads <= 1 || ng < 2 {
+    if n_threads <= 1 || ng < 2 || p1.len() + p2.len() < split_min_bytes() {
         let o1 = out1.as_mut_ptr();
         let o2 = out2.as_mut_ptr();
         if ty == GgmlType::Q4_K || ty == GgmlType::Q6_K {
@@ -1071,8 +1216,276 @@ unsafe fn group_dot_any(ty: GgmlType, q_row: &[u8], kb: usize, packed: &[u8], gr
     }
 }
 
+// ---------- register-blocked GEMM inner kernels (Phase 6.8) ----------
+//
+// The Phase 6.6 audit ranked the GEMM as the binding term of prefill after
+// Phase 6.7 (LFM3 GEMM 82 % of prefill wall at 0.55 GB/s; §9.4/§9.8 item 2)
+// and §8.1 root-caused it: `gemm_band` called `group_dot_*` once per
+// (group, row), so every row re-LOADED and re-UNPACKED the same weight tile
+// and ran one serial 8-deep dpbusd dependency chain (~17 % of the VNNI
+// issue-rate ceiling). The kernels below process a block of RB rows per
+// pass: tile bytes are loaded and nibbles unpacked ONCE per (group, k) and
+// streamed into RB independent accumulator chains — both the load/unpack
+// traffic and the latency exposure divide by RB. A 16x pre-broadcast
+// activation layout was evaluated and rejected by arithmetic: the
+// broadcast bytes would be re-swept once per 16-column group (ng sweeps of
+// a 16x M*kb buffer = GB-scale L3 traffic per GEMM call), so the broadcast
+// stays an in-register `vpermd` — the same 1-shuffle-per-dpbusd ratio
+// llama.cpp's own non-AMX VNNI path runs at.
+//
+// Bit-identity contract (unchanged from Phase 6.5): per row the instruction
+// sequence — activation loads, broadcast indices, dpbusd order, integer
+// scale multiplies, f32 FMA/FMA order — is IDENTICAL to `group_dot_*` on
+// that row, so every GEMM column stays bit-identical to `matvec_vnni` run
+// on the single token.
+
+/// Rows per register block.
+const RB: usize = 4;
+
+/// Q8_0/Q5_0 family, RB rows per tile pass.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,f16c")]
+unsafe fn group_dot4_q8_0(
+    q: &QBatch,
+    m0: usize,
+    kb: usize,
+    packed: &[u8],
+    group: usize,
+    out: *mut f32,
+    out_stride: usize,
+) {
+    use std::arch::x86_64::*;
+    let off = _mm512_set1_epi8(-128i8); // 0x80 as u8 (s8s8 offset)
+    let mut acc = [_mm512_setzero_ps(); RB];
+    let rowp: [*const u8; RB] = std::array::from_fn(|r| q.row(m0 + r).as_ptr());
+    for k in 0..kb {
+        let tile = &packed[(group * kb + k) * TILE_BYTES..][..TILE_BYTES];
+        let t = tile.as_ptr();
+        let vd0 = _mm512_cvtph_ps(_mm256_loadu_si256(t.add(512) as *const __m256i));
+        let vcomp = _mm512_loadu_si512(t.add(544) as *const __m512i);
+        let mut vsum = [_mm512_setzero_si512(); RB];
+        for w in 0..8usize {
+            // the weight row is loaded once and fed to all RB rows
+            let vb = _mm512_loadu_si512(t.add(w * 64) as *const __m512i);
+            for r in 0..RB {
+                let a = std::ptr::read_unaligned(rowp[r].add(k * 34 + 2 + 4 * w) as *const i32);
+                let va = _mm512_add_epi8(_mm512_set1_epi32(a), off);
+                vsum[r] = _mm512_dpbusd_epi32(vsum[r], va, vb);
+            }
+        }
+        for r in 0..RB {
+            let v = _mm512_sub_epi32(vsum[r], vcomp);
+            let d = std::ptr::read_unaligned(rowp[r].add(k * 34) as *const [u8; 2]);
+            let vd1 = _mm512_set1_ps(h_f16(d));
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(v), _mm512_mul_ps(vd0, vd1), acc[r]);
+        }
+    }
+    for r in 0..RB {
+        _mm512_storeu_ps(out.add((m0 + r) * out_stride + group * TILE_N) as *mut f32, acc[r]);
+    }
+}
+
+/// Q4_K, RB rows per tile pass (tile nibble unpack hoisted out of the row
+/// loop; per-row dpbusd chains independent).
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn group_dot4_q4_k(
+    q: &QBatch,
+    m0: usize,
+    kb: usize,
+    packed: &[u8],
+    group: usize,
+    out: *mut f32,
+    out_stride: usize,
+) {
+    use std::arch::x86_64::*;
+    let m4 = _mm512_set1_epi8(0xF);
+    let mut acc = [_mm512_setzero_ps(); RB];
+    let rowp: [*const u8; RB] = std::array::from_fn(|r| q.row(m0 + r).as_ptr());
+    for s in 0..kb {
+        let tile = &packed[(group * kb + s) * TILE_BYTES_Q4K..][..TILE_BYTES_Q4K];
+        let t = tile.as_ptr();
+        let mut acci = [_mm512_setzero_si512(); RB];
+        let mut va_bsum = [_mm512_setzero_si512(); RB];
+        let mut vd1 = [_mm512_setzero_ps(); RB];
+        for r in 0..RB {
+            let ab = rowp[r].add(s * 292);
+            let bsums = _mm256_loadu_si256(ab.add(260) as *const __m256i);
+            let q8s = _mm_hadd_epi16(
+                _mm256_castsi256_si128(bsums),
+                _mm256_extracti128_si256(bsums, 1),
+            );
+            va_bsum[r] = _mm512_castsi128_si512(q8s);
+            vd1[r] = _mm512_set1_ps(f32::from_le_bytes(std::ptr::read_unaligned(ab as *const [u8; 4])));
+        }
+        // step 1: accumulate the quants (8 sub-groups x 4 chunks x 2 dpbusd)
+        for kg in 0..8usize {
+            let mut va = [_mm512_setzero_si512(); RB];
+            for r in 0..RB {
+                va[r] = _mm512_castsi256_si512(
+                    _mm256_loadu_si256(rowp[r].add(s * 292 + 4 + 32 * kg) as *const __m256i),
+                );
+            }
+            let mut vsum = [_mm512_setzero_si512(); RB];
+            for c in 0..4usize {
+                // tile chunk loaded + nibbles unpacked ONCE for the whole row block
+                let bytes = _mm512_loadu_si512(t.add(256 * kg + 64 * c) as *const __m512i);
+                let nb0 = _mm512_and_si512(bytes, m4);
+                let nb1 = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), m4);
+                let i0 = _mm512_set1_epi32((2 * c) as i32);
+                let i1 = _mm512_set1_epi32((2 * c + 1) as i32);
+                for r in 0..RB {
+                    // nibbles are the UNSIGNED dpbusd operand; activations the signed one
+                    vsum[r] = _mm512_dpbusd_epi32(
+                        vsum[r],
+                        nb0,
+                        _mm512_permutexvar_epi32(i0, va[r]),
+                    );
+                    vsum[r] = _mm512_dpbusd_epi32(
+                        vsum[r],
+                        nb1,
+                        _mm512_permutexvar_epi32(i1, va[r]),
+                    );
+                }
+            }
+            let vscale = _mm512_cvtepi8_epi32(
+                _mm_loadu_si128(t.add(Q4K_OFF_SCALES + 16 * kg) as *const __m128i),
+            );
+            for r in 0..RB {
+                acci[r] = _mm512_add_epi32(acci[r], _mm512_mullo_epi32(vsum[r], vscale));
+            }
+        }
+        let vd0 = _mm512_cvtph_ps(_mm256_loadu_si256(t.add(Q4K_OFF_D) as *const __m256i));
+        for r in 0..RB {
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acci[r]), _mm512_mul_ps(vd0, vd1[r]), acc[r]);
+        }
+        // step 2: the min term — dpwssds over (bsum pair, min pair) per column;
+        // the four min chunks are widened once and shared by the whole row block
+        let mut vbm = [_mm512_setzero_si512(); 4];
+        for k in 0..4usize {
+            vbm[k] = _mm512_cvtepi8_epi16(
+                _mm256_loadu_si256(t.add(Q4K_OFF_MINS + 32 * k) as *const __m256i),
+            );
+        }
+        let vdmin = _mm512_cvtph_ps(_mm256_loadu_si256(t.add(Q4K_OFF_DMIN) as *const __m256i));
+        for r in 0..RB {
+            let mut acc_m = _mm512_setzero_si512();
+            for k in 0..4usize {
+                let vbs = _mm512_permutexvar_epi32(_mm512_set1_epi32(k as i32), va_bsum[r]);
+                acc_m = _mm512_dpwssds_epi32(acc_m, vbs, vbm[k]);
+            }
+            acc[r] = _mm512_fnmadd_ps(_mm512_cvtepi32_ps(acc_m), _mm512_mul_ps(vdmin, vd1[r]), acc[r]);
+        }
+    }
+    for r in 0..RB {
+        _mm512_storeu_ps(out.add((m0 + r) * out_stride + group * TILE_N) as *mut f32, acc[r]);
+    }
+}
+
+/// Q6_K, RB rows per tile pass (4-bit + 2-bit merge hoisted; per-row
+/// (q-32) compensation from the precomputed vcomp[r]).
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn group_dot4_q6_k(
+    q: &QBatch,
+    m0: usize,
+    kb: usize,
+    packed: &[u8],
+    group: usize,
+    out: *mut f32,
+    out_stride: usize,
+) {
+    use std::arch::x86_64::*;
+    let m4 = _mm512_set1_epi8(0xF);
+    let m3 = _mm512_set1_epi8(0x3);
+    let mc = _mm512_set1_epi8(0xC);
+    let m30 = _mm512_set1_epi8(0x30);
+    let mc0 = _mm512_set1_epi8(0xC0u8 as i8);
+    let m32 = _mm512_set1_epi32(32);
+    let mut acc = [_mm512_setzero_ps(); RB];
+    let rowp: [*const u8; RB] = std::array::from_fn(|r| q.row(m0 + r).as_ptr());
+    for s in 0..kb {
+        let tile = &packed[(group * kb + s) * TILE_BYTES_Q6K..][..TILE_BYTES_Q6K];
+        let t = tile.as_ptr();
+        let mut vcomp = [_mm512_setzero_si512(); RB];
+        let mut vd1 = [_mm512_setzero_ps(); RB];
+        for r in 0..RB {
+            let ab = rowp[r].add(s * 292);
+            let bsums = _mm256_loadu_si256(ab.add(260) as *const __m256i);
+            vcomp[r] = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(bsums), m32);
+            vd1[r] = _mm512_set1_ps(f32::from_le_bytes(std::ptr::read_unaligned(ab as *const [u8; 4])));
+        }
+        let mut acci = [_mm512_setzero_si512(); RB];
+        for g16 in 0..16usize {
+            let r_ = g16 >> 2;
+            let d = (4 * g16 - 16 * r_) as i32; // dword base of group g16 within the activation
+            let idx0 = _mm512_set1_epi32(d);
+            let idx1 = _mm512_set1_epi32(d + 1);
+            let idx2 = _mm512_set1_epi32(d + 2);
+            let idx3 = _mm512_set1_epi32(d + 3);
+            // tile loads + the 4-bit/2-bit merge: once per (g16), shared by RB rows
+            let hbits = _mm512_loadu_si512(t.add(Q6K_OFF_QH + 64 * g16) as *const __m512i);
+            let bytes0 = _mm512_loadu_si512(t.add(128 * g16) as *const __m512i);
+            let bytes1 = _mm512_loadu_si512(t.add(128 * g16 + 64) as *const __m512i);
+            let vb0 = _mm512_add_epi8(
+                _mm512_and_si512(bytes0, m4),
+                _mm512_slli_epi16(_mm512_and_si512(hbits, m3), 4),
+            );
+            let vb1 = _mm512_add_epi8(
+                _mm512_and_si512(_mm512_srli_epi16(bytes0, 4), m4),
+                _mm512_slli_epi16(_mm512_and_si512(hbits, mc), 2),
+            );
+            let vb2 = _mm512_add_epi8(_mm512_and_si512(bytes1, m4), _mm512_and_si512(hbits, m30));
+            let vb3 = _mm512_add_epi8(
+                _mm512_and_si512(_mm512_srli_epi16(bytes1, 4), m4),
+                _mm512_srli_epi16(_mm512_and_si512(hbits, mc0), 2),
+            );
+            let vscale = _mm512_cvtepi8_epi32(
+                _mm_loadu_si128(t.add(Q6K_OFF_SCALES + 16 * g16) as *const __m128i),
+            );
+            let ig16 = _mm512_set1_epi32(g16 as i32);
+            for r in 0..RB {
+                let va = _mm512_loadu_si512(rowp[r].add(s * 292 + 4 + 64 * r_) as *const __m512i);
+                let mut vsum = _mm512_setzero_si512();
+                vsum = _mm512_dpbusd_epi32(vsum, vb0, _mm512_permutexvar_epi32(idx0, va));
+                vsum = _mm512_dpbusd_epi32(vsum, vb1, _mm512_permutexvar_epi32(idx1, va));
+                vsum = _mm512_dpbusd_epi32(vsum, vb2, _mm512_permutexvar_epi32(idx2, va));
+                vsum = _mm512_dpbusd_epi32(vsum, vb3, _mm512_permutexvar_epi32(idx3, va));
+                // - 32*sum(activation) per 16-group
+                vsum = _mm512_sub_epi32(vsum, _mm512_permutexvar_epi32(ig16, vcomp[r]));
+                acci[r] = _mm512_add_epi32(acci[r], _mm512_mullo_epi32(vsum, vscale));
+            }
+        }
+        let vd0 = _mm512_cvtph_ps(_mm256_loadu_si256(t.add(Q6K_OFF_D) as *const __m256i));
+        for r in 0..RB {
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acci[r]), _mm512_mul_ps(vd0, vd1[r]), acc[r]);
+        }
+    }
+    for r in 0..RB {
+        _mm512_storeu_ps(out.add((m0 + r) * out_stride + group * TILE_N) as *mut f32, acc[r]);
+    }
+}
+
+/// Dispatch a RB-row block for any supported packed type.
+#[inline]
+unsafe fn group_dot4_any(
+    ty: GgmlType,
+    q: &QBatch,
+    m0: usize,
+    kb: usize,
+    packed: &[u8],
+    group: usize,
+    out: *mut f32,
+    out_stride: usize,
+) {
+    match ty {
+        GgmlType::Q4_K => group_dot4_q4_k(q, m0, kb, packed, group, out, out_stride),
+        GgmlType::Q6_K => group_dot4_q6_k(q, m0, kb, packed, group, out, out_stride),
+        _ => group_dot4_q8_0(q, m0, kb, packed, group, out, out_stride),
+    }
+}
+
 /// Band of a packed GEMM: groups [g_lo, g_hi) × all M rows, writing
-/// out[m * out_stride + g*16 .. +16]. Weights stream once; rows hit L1/L2.
+/// out[m * out_stride + g*16 .. +16]. Weights stream once; rows run in
+/// RB-row register blocks (tile load + unpack amortized over RB rows,
+/// RB independent accumulator chains), tails through the per-row path.
 #[allow(clippy::too_many_arguments)]
 unsafe fn gemm_band(
     packed: &[u8],
@@ -1086,11 +1499,19 @@ unsafe fn gemm_band(
     is_caller: bool,
 ) {
     let t0 = if kstats::enabled() { kstats::tsc() } else { 0 };
+    let rows = q.rows();
     for g in g_lo..g_hi {
-        for m in 0..q.rows() {
+        let mut m = 0usize;
+        while m + RB <= rows {
+            // the kernel adds group*TILE_N itself — pass the row-0 base
+            group_dot4_any(ty, q, m, kb, packed, g, out, out_stride);
+            m += RB;
+        }
+        while m < rows {
+            let obase = out.add(g * TILE_N);
             let r = group_dot_any(ty, q.row(m), kb, packed, g);
-            let dst = out.add(m * out_stride + g * TILE_N);
-            std::ptr::copy_nonoverlapping(r.as_ptr(), dst, TILE_N);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), obase.add(m * out_stride), TILE_N);
+            m += 1;
         }
     }
     if kstats::enabled() {
@@ -1219,7 +1640,8 @@ pub fn gemm2_prepared(
     }
 }
 
-/// Band of the fused GEMM pair (concatenated group space [0, ng1+ng2)).
+/// Band of the fused GEMM pair (concatenated group space [0, ng1+ng2));
+/// per group the row block runs through the RB-row kernel.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn gemm2_band(
@@ -1238,16 +1660,23 @@ unsafe fn gemm2_band(
     is_caller: bool,
 ) {
     let t0 = if kstats::enabled() { kstats::tsc() } else { 0 };
+    let rows = q.rows();
     for g in g_lo..g_hi {
         let (pp, o_ptr, o_stride, gg) = if g < ng1 {
             (p1, out1, stride1, g)
         } else {
             (p2, out2, stride2, g - ng1)
         };
-        for m in 0..q.rows() {
+        let obase = o_ptr.add(gg * TILE_N);
+        let mut m = 0usize;
+        while m + RB <= rows {
+            group_dot4_any(ty, q, m, kb, pp, gg, o_ptr, o_stride);
+            m += RB;
+        }
+        while m < rows {
             let r = group_dot_any(ty, q.row(m), kb, pp, gg);
-            let dst = o_ptr.add(m * o_stride + gg * TILE_N);
-            std::ptr::copy_nonoverlapping(r.as_ptr(), dst, TILE_N);
+            std::ptr::copy_nonoverlapping(r.as_ptr(), obase.add(m * o_stride), TILE_N);
+            m += 1;
         }
     }
     if kstats::enabled() {

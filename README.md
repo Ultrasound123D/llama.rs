@@ -2,9 +2,9 @@
 
 A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage**, output-compatible with llama.cpp — proven by automated parity tests (24/24 passing).
 
-**Releases:** [v0.1.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.1.0) (engine complete, parity 16/16) → [v0.2.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.2.0) (SIMD kernels, Qwen decode ~2.5×) → [v0.3.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.3.0) (packed VNNI + batched prefill — at/above llama.cpp on two axes; linux-x64 binary attached). Release notes carry the measured evidence for each milestone.
+**Releases:** [v0.1.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.1.0) (engine complete, parity 16/16) → [v0.2.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.2.0) (SIMD kernels, Qwen decode ~2.5×) → [v0.3.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.3.0) (packed VNNI + batched prefill — at/above llama.cpp on two axes; linux-x64 binary attached) → [v0.4.0](https://github.com/Ultrasound123D/llama.rs/releases/tag/v0.4.0) (flash attention + register-blocked GEMM + grouped q/k/v dispatch — Qwen decode 97 %, LFM3 prefill 91 %, Qwen prefill 141 % of llama.cpp; linux-x64 binary attached). Release notes carry the measured evidence for each milestone.
 
-## Status (v0.3 — Phases 0–6.7 complete)
+## Status (v0.4 — Phases 0–6.8 complete)
 
 | Feature | Status | Evidence |
 |---|---|---|
@@ -22,6 +22,7 @@ A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage*
 | **Phase 6.5 memory reclaim** (madvise of repacked originals) | ✅ | LFM3 peak RSS **2050 → 1227 MB**; Qwen **1079 → 706 MB** steady / 724 peak |
 | **Phase 6.6 Decode & Kernel Bottleneck Audit** (stage profiling, DRAM-ceiling accounting, CPU-counter probe, ctx/batch sweeps) | ✅ | every remaining gap classified with evidence (`PERFORMANCE_REPORT.md` §9): decode is kernel-limited (not memory — LFM3 streams 12.2 GB/s, equal to llama.cpp); prefill is instruction-throughput bound; **new: the per-key f32 attention core is 54 % of Qwen prefill and up to 72 % of long-context decode** |
 | **Phase 6.7 attention flash kernel** (blocked online-softmax, register-blocked V, SWA-aware; + `target_feature` shim-call fix, + FTZ/DAZ guard) | ✅ | LFM3 long-ctx decode **50 % → 79 %** of llama.cpp at ctx 4k (curve near-flat: 103/97/93/79 %); Qwen ctx 4k **28 % → 43 %**; **Qwen prefill 115 %** of llama.cpp (179 vs 156); LFM3 tg holds **105 %**; attention share of Qwen prefill **54 % → 11–13 %**; parity 24/24, 42 tests |
+| **Phase 6.8 register-blocked GEMM + grouped q/k/v dispatch** (RB=4-row tile kernels for all repacked types; one quantization + one band-split for the q/k/v triple; small-tensor single-band policy) | ✅ | K-quant GEMM **1.7–2.1×** at M=128 (gate+up pair 297→150 µs/tok, 0.47→0.92 GB/s); **LFM3 prefill 43 % → 91 %** of llama.cpp (M=128, 90.1 tok/s, 2.1×); **Qwen prefill 141 %** (215 tok/s at M=256); **Qwen decode 77–85 % → 97 %** (25.1 vs 25.8 tok/s); LFM3 tg 106–108 %; bit-identity to `matvec_vnni` proven per column; parity 24/24, 43 tests |
 
 ## Build & run
 
