@@ -342,7 +342,7 @@ pub struct Lfm3 {
     s_out: Vec<f32>,
     s_gate: Vec<f32>, s_up: Vec<f32>, s_ffn: Vec<f32>,
     s_q: Vec<f32>, s_k: Vec<f32>, s_v: Vec<f32>, s_gate_h: Vec<f32>,
-    s_scores: Vec<f32>, s_attn: Vec<f32>,
+    s_attn: Vec<f32>,
     logits: Vec<f32>,
     // small preloaded f32 weights
     w_attn_norm: Vec<Vec<f32>>,
@@ -376,13 +376,11 @@ struct Lfm3Batch {
     in_proj: Vec<f32>,  // M × 3n_e  shortconv in_proj
     conv_w: Vec<f32>,   // n_e × (M + d_conv) channel-major window
     conv_y: Vec<f32>,   // M × n_e
-    scores: Vec<f32>,   // per-band softmax scratch
-    scores2: Vec<f32>,
 }
 
 impl Lfm3Batch {
     fn new(m_max: usize, n_e: usize, n_ff: usize, nkv: usize, hd: usize, nh: usize,
-           d_conv: usize, n_ctx: usize) -> Lfm3Batch {
+           d_conv: usize, _n_ctx: usize) -> Lfm3Batch {
         Lfm3Batch {
             x: vec![0f32; m_max * n_e],
             h: vec![0f32; m_max * n_e],
@@ -400,8 +398,6 @@ impl Lfm3Batch {
             in_proj: vec![0f32; m_max * 3 * n_e],
             conv_w: vec![0f32; n_e * (m_max + d_conv)],
             conv_y: vec![0f32; m_max * n_e],
-            scores: vec![0f32; n_ctx],
-            scores2: vec![0f32; n_ctx],
         }
     }
 }
@@ -486,7 +482,7 @@ impl Lfm3 {
             s_gate: vec![0f32; n_ff], s_up: vec![0f32; n_ff], s_ffn: vec![0f32; n_ff],
             s_q: vec![0f32; n_embd], s_k: vec![0f32; n_head_kv * head_dim],
             s_v: vec![0f32; n_head_kv * head_dim], s_gate_h: vec![0f32; n_head],
-            s_scores: Vec::new(), s_attn: vec![0f32; n_head * head_dim],
+            s_attn: vec![0f32; n_head * head_dim],
             logits: vec![0f32; 0],
             w_attn_norm, w_ffn_norm, w_post_anorm, w_post_fnorm,
             w_q_norm, w_k_norm, w_output_norm,
@@ -653,7 +649,7 @@ impl Lfm3 {
             let qs = &self.s_q[hq * hd..(hq + 1) * hd];
             // we pass the rows of one kv head
             let (s, v) = (&kcache[..], &vcache[..]);
-            attention_one_head_sliced(qs, s, v, n_kv, nkv, kvh, hd, swa, &mut out_scratch, &mut self.s_scores);
+            attention_one_head_sliced(qs, s, v, n_kv, nkv, kvh, hd, swa, &mut out_scratch);
             let g = self.s_gate_h[hq];
             for i in 0..hd {
                 self.s_attn[hq * hd + i] = out_scratch[i] * g;
@@ -1001,23 +997,20 @@ impl Lfm3 {
             let ta0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             if m >= 2 {
                 let mid = row_split(m);
-                let (s1, s2) = (&mut b.scores, &mut b.scores2);
                 let lo = move || unsafe {
                     attn_rows_lfm3(q, g, out_ptr, kcache, vcache, 0, mid, pos0,
-                        n_e, nh, nkv, hd, rep, swa, scale, s1);
+                        n_e, nh, nkv, hd, rep, swa, scale);
                 };
                 let hi = move || unsafe {
                     attn_rows_lfm3(q, g, out_ptr, kcache, vcache, mid, m, pos0,
-                        n_e, nh, nkv, hd, rep, swa, scale, s2);
+                        n_e, nh, nkv, hd, rep, swa, scale);
                 };
                 par_chunks2(lo, hi);
             } else {
-                let mut s = std::mem::take(&mut b.scores);
                 unsafe {
                     attn_rows_lfm3(q, g, out_ptr, kcache, vcache, 0, m, pos0,
-                        n_e, nh, nkv, hd, rep, swa, scale, &mut s);
+                        n_e, nh, nkv, hd, rep, swa, scale);
                 }
-                b.scores = s;
             }
             if prof::prof_enabled() {
                 prof::record(pbucket("attn_core(batch)"), ta0, 0);
@@ -1190,26 +1183,19 @@ unsafe fn attn_rows_lfm3(
     rep: usize,
     swa: Option<usize>,
     scale: f32,
-    scores: &mut Vec<f32>,
 ) {
-    use llama_kernels::batch as bf;
+    // Phase 6.7 P0: the flash-style blocked kernel per (row, head) — the
+    // audit measured this loop at 54.3 % of Qwen prefill / 24.9 % of
+    // LFM3's with the old push-dot/softmax/axpy structure (§9.4).
+    use llama_kernels::batch::attn_head_flash;
     for r in r_lo..r_hi {
         for hq in 0..nh {
             let kvh = hq / rep;
             let n_kv = pos0 + r + 1;
             let lo = swa.map(|w| (pos0 + r).saturating_sub(w - 1)).unwrap_or(0);
             let qs = &q[r * n_e + hq * hd..][..hd];
-            scores.clear();
-            for p in lo..n_kv {
-                let k = &kcache[p * nkv * hd + kvh * hd..][..hd];
-                scores.push(bf::dot_f32(qs, k) * scale);
-            }
-            bf::softmax_inplace_f32(scores);
             let orow = std::slice::from_raw_parts_mut(out.add(r * n_e + hq * hd), hd);
-            for (wgt, p) in scores.iter().zip(lo..n_kv) {
-                let v = &vcache[p * nkv * hd + kvh * hd..][..hd];
-                bf::axpy_f32(*wgt, v, orow);
-            }
+            attn_head_flash(qs, kcache, vcache, nkv, kvh, lo, n_kv, hd, scale, orow);
             let g0 = g[r * nh + hq];
             for v in orow.iter_mut() {
                 *v *= g0;
@@ -1218,7 +1204,11 @@ unsafe fn attn_rows_lfm3(
     }
 }
 
-/// One attention head reading the rows of a given kv head from [n_kv][nkv*hd] buffers
+/// One attention head reading the rows of a given kv head from [n_kv][nkv*hd] buffers.
+/// Phase 6.7 P0: the body is the flash-style blocked kernel (audit §9.5:
+/// the old per-key scalar loop was 72.7 % of long-ctx decode wall).
+/// Keys before the SWA window's `lo` are never visited — identical math to
+/// the old -inf masking (zero-weight terms), none of the work.
 pub fn attention_one_head_sliced(
     q: &[f32],
     k_all: &[f32], v_all: &[f32],
@@ -1226,35 +1216,14 @@ pub fn attention_one_head_sliced(
     hd: usize,
     swa_window: Option<usize>,
     out: &mut [f32],
-    scores: &mut Vec<f32>,
 ) {
     let scale = 1.0 / (hd as f32).sqrt();
-    scores.clear();
-    for p in 0..n_kv {
-        let k = &k_all[p * nkv * hd + kv_head * hd..p * nkv * hd + (kv_head + 1) * hd];
-        let mut dot = 0f32;
-        for i in 0..hd {
-            dot += q[i] * k[i];
-        }
-        scores.push(dot * scale);
-    }
-    if let Some(w) = swa_window {
-        let pos = n_kv - 1;
-        let lo = pos.saturating_sub(w - 1);
-        for (p, s) in scores.iter_mut().enumerate() {
-            if p < lo { *s = f32::NEG_INFINITY; }
-        }
-    }
-    softmax_inplace(scores);
-    for o in out.iter_mut() { *o = 0.0; }
-    for p in 0..n_kv {
-        let wgt = scores[p];
-        if wgt == 0.0 { continue; }
-        let v = &v_all[p * nkv * hd + kv_head * hd..p * nkv * hd + (kv_head + 1) * hd];
-        for i in 0..hd {
-            out[i] += wgt * v[i];
-        }
-    }
+    let lo = swa_window
+        .map(|w| (n_kv - 1).saturating_sub(w - 1))
+        .unwrap_or(0);
+    llama_kernels::batch::attn_head_flash(
+        q, k_all, v_all, nkv, kv_head, lo, n_kv, hd, scale, out,
+    );
 }
 
 // ============ llama family (llama1/2/3, qwen2, qwen2.5) ============
@@ -1278,7 +1247,7 @@ pub struct LlamaFamily {
     /// Phase 6.3/6.4: repacked VNNI weights (Q8_0/Q5_0/Q4_K/Q6_K) by tensor name
     packed: PackedMap,
     s_q: Vec<f32>, s_k: Vec<f32>, s_v: Vec<f32>, s_attn: Vec<f32>,
-    s_gate: Vec<f32>, s_up: Vec<f32>, s_ffn: Vec<f32>, s_scores: Vec<f32>,
+    s_gate: Vec<f32>, s_up: Vec<f32>, s_ffn: Vec<f32>,
     logits: Vec<f32>,
     w_attn_norm: Vec<Vec<f32>>,
     w_ffn_norm: Vec<Vec<f32>>,
@@ -1304,12 +1273,10 @@ struct LlamaBatch {
     up: Vec<f32>,       // M × n_ff
     ffni: Vec<f32>,     // M × n_ff
     ffn_out: Vec<f32>,  // M × n_e
-    scores: Vec<f32>,
-    scores2: Vec<f32>,
 }
 
 impl LlamaBatch {
-    fn new(m_max: usize, n_e: usize, n_ff: usize, nkv: usize, hd: usize, n_ctx: usize) -> LlamaBatch {
+    fn new(m_max: usize, n_e: usize, n_ff: usize, nkv: usize, hd: usize, _n_ctx: usize) -> LlamaBatch {
         LlamaBatch {
             x: vec![0f32; m_max * n_e],
             h: vec![0f32; m_max * n_e],
@@ -1322,8 +1289,6 @@ impl LlamaBatch {
             up: vec![0f32; m_max * n_ff],
             ffni: vec![0f32; m_max * n_ff],
             ffn_out: vec![0f32; m_max * n_e],
-            scores: vec![0f32; n_ctx],
-            scores2: vec![0f32; n_ctx],
         }
     }
 }
@@ -1368,7 +1333,6 @@ impl LlamaFamily {
             s_q: vec![0f32; n_embd], s_k: vec![0f32; n_head_kv * head_dim],
             s_v: vec![0f32; n_head_kv * head_dim], s_attn: vec![0f32; n_embd],
             s_gate: vec![0f32; n_ff], s_up: vec![0f32; n_ff], s_ffn: vec![0f32; n_ff],
-            s_scores: Vec::new(),
             logits: vec![],
             w_attn_norm, w_ffn_norm, w_output_norm,
             b_q, b_k, b_v,
@@ -1440,7 +1404,7 @@ impl LlamaFamily {
                 let kvh = hq / rep;
                 let qs = &self.s_q[hq * self.head_dim..(hq + 1) * self.head_dim];
                 attention_one_head_sliced(qs, kcache, vcache, n_kv, self.n_head_kv, kvh,
-                    self.head_dim, None, &mut out_scratch, &mut self.s_scores);
+                    self.head_dim, None, &mut out_scratch);
                 self.s_attn[hq * self.head_dim..(hq + 1) * self.head_dim].copy_from_slice(&out_scratch);
             }
             if prof::prof_enabled() {
@@ -1652,23 +1616,20 @@ impl LlamaFamily {
                 let ta0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 if m >= 2 {
                     let mid = row_split(m);
-                    let (s1, s2) = (&mut b.scores, &mut b.scores2);
                     let lo = move || unsafe {
                         attn_rows_causal(q, out_ptr, kcache, vcache, 0, mid, pos0,
-                            n_e, nh, nkv, hd, rep, scale, s1);
+                            n_e, nh, nkv, hd, rep, scale);
                     };
                     let hi = move || unsafe {
                         attn_rows_causal(q, out_ptr, kcache, vcache, mid, m, pos0,
-                            n_e, nh, nkv, hd, rep, scale, s2);
+                            n_e, nh, nkv, hd, rep, scale);
                     };
                     par_chunks2(lo, hi);
                 } else {
-                    let mut s = std::mem::take(&mut b.scores);
                     unsafe {
                         attn_rows_causal(q, out_ptr, kcache, vcache, 0, m, pos0,
-                            n_e, nh, nkv, hd, rep, scale, &mut s);
+                            n_e, nh, nkv, hd, rep, scale);
                     }
-                    b.scores = s;
                 }
                 if prof::prof_enabled() {
                     prof::record(pbucket("attn_core(batch)"), ta0, 0);
@@ -1783,31 +1744,23 @@ unsafe fn attn_rows_causal(
     hd: usize,
     rep: usize,
     scale: f32,
-    scores: &mut Vec<f32>,
 ) {
-    use llama_kernels::batch as bf;
+    // Phase 6.7 P0: the flash-style blocked kernel per (row, head) —
+    // causal range [0, pos0 + r + 1) per row (no SWA on this family).
+    use llama_kernels::batch::attn_head_flash;
     for r in r_lo..r_hi {
         for hq in 0..nh {
             let kvh = hq / rep;
             let n_kv = pos0 + r + 1;
             let qs = &q[r * n_e + hq * hd..][..hd];
-            scores.clear();
-            for p in 0..n_kv {
-                let k = &kcache[p * nkv * hd + kvh * hd..][..hd];
-                scores.push(bf::dot_f32(qs, k) * scale);
-            }
-            bf::softmax_inplace_f32(scores);
             let orow = std::slice::from_raw_parts_mut(out.add(r * n_e + hq * hd), hd);
-            for (wgt, p) in scores.iter().zip(0..n_kv) {
-                let v = &vcache[p * nkv * hd + kvh * hd..][..hd];
-                bf::axpy_f32(*wgt, v, orow);
-            }
+            attn_head_flash(qs, kcache, vcache, nkv, kvh, 0, n_kv, hd, scale, orow);
         }
     }
 }
 
 // imports (aggregated)
 use crate::{W, weights1d, rmsnorm, rmsnorm_into, rmsnorm_inplace, rope_neox_inplace,
-    softmax_inplace, sigmoid, silu};
+    sigmoid, silu};
 #[allow(unused_imports)]
 use Value as _;
