@@ -14,7 +14,7 @@ A GGUF inference engine written in pure Rust, **with zero C/C++ runtime linkage*
 | LFM3 chat template (thinking tags extracted from the raw template) + ChatML | ✅ | chat mode works on both models |
 | Sampling: greedy/temp/top-k/top-p | ✅ | — |
 | CLI: generate/chat/tokenize/bench/debug | ✅ | — |
-| **Phase 6 SIMD kernels** (int8-domain AVX2+VNNI vec_dots, activation quantizers, persistent worker pool) | ✅ | LFM3-1.7B: **0.9 → 8.7 tok/s (~10×)** on this 2-vCPU VM (llama.cpp AVX-512 build: 11.9); parity 16/16 still green |
+| **Phase 6 SIMD kernels** (int8-domain AVX2+VNNI vec_dots, activation quantizers, persistent worker pool) | ✅ | LFM3-1.7B: **0.9 → 12.0 tok/s (~13×)** on this 2-vCPU VM; parity 16/16 still green |
 
 ## Build & run
 
@@ -60,7 +60,7 @@ Synthetic unit tests (hand-built GGUF + hand-computed quantization blocks) run i
 
 ## v0 limits (full honesty)
 
-- **Throughput vs llama.cpp on this VM** (matched 2-thread benchmark with exactly-matched prompt lengths, prefill/decode measured separately, medians): LFM3-1.7B decode 8.62 vs 10.65 tok/s (81%); Qwen2.5-0.5B decode 23.77 vs 31.98 tok/s (74%); the packed VNNI path alone accounts for +81% of Qwen's decode (12.90 → 23.38 same-binary A/B). Prefill: 8.66 / 24.45 vs 84.16 / 157.95 tok/s — llama.rs prefills token-by-token while llama.cpp batches the whole prompt (M>1, where its real AMX tile kernels run); batched prefill is the largest remaining gap. llama.cpp's simple-quant decode tensors run on its **repacked-VNNI M=1 route** (ported here as `llama-kernels/src/vnni.rs` — AVX-512 VNNI; no AMX tile instructions are executed by this engine), and that path is **verified against an independent C golden built from llama.cpp's own quantizer and vec_dot sources** (byte-exact quantizer, 1e-7-of-term-energy agreement across 72 randomized + edge cases — see `PERFORMANCE_REPORT.md` §3.4).
+- **Throughput vs llama.cpp on this VM** (matched 2-thread benchmark with exactly-matched prompt lengths, prefill/decode measured separately, medians): **LFM3-1.7B decode 12.02 vs 11.74 tok/s — 102%, faster than llama.cpp**; Qwen2.5-0.5B decode 23.86 vs 30.34 tok/s (79%). Prefill: 12.06 / 24.94 vs 88.94 / 154.91 tok/s — llama.rs prefills token-by-token while llama.cpp batches the whole prompt (M>1, where its real AMX tile kernels run); **batched prefill is the largest remaining gap**. All quantized decode tensors — Q8_0/Q5_0 *and* the K-quants Q4_K/Q6_K — now run on the repacked-VNNI M=1 route (ported from llama.cpp's AMX backend as `llama-kernels/src/vnni.rs` — AVX-512 VNNI; no AMX tile instructions are executed by this engine), and that path is **verified against an independent C golden built from llama.cpp's own quantizer and vec_dot sources** (byte-exact quantizers, 1e-7-of-term-energy agreement across 153 randomized + edge cases — see `PERFORMANCE_REPORT.md` §3.4). Same-binary A/B: the packed path alone lifts LFM3 decode 8.85 → 12.02 tok/s (+36%). Honest cost: the packed map co-resides with the original weights (~2× model RAM, the same trade llama.cpp's AMX repack makes).
 - An AVX-512 VNNI q4_K kernel exists (`llama-kernels/src/avx512.rs`, `examples/q4cmp.rs`) but measured ~9% slower than AVX2 on this VM (frequency licensing) — kept off the default dispatch.
 - No HTTP server/batching/GPU yet (Phase 7); two supported architectures (Phase 8 expands this).
 - Chat template subset (no full jinja).

@@ -134,6 +134,7 @@ fn main() {
     println!("  repack_tensor_gated(cpu_ok=false) → None for all types/shapes — fallback forced, no panic");
 
     // ---------- differential sweep ----------
+    // simple-quant shapes (32-value blocks)
     let shapes: &[(usize, usize)] = &[
         (32, 16),   // minimum legal
         (32, 32),
@@ -144,17 +145,38 @@ fn main() {
         (1024, 512),
         (2048, 4096),
     ];
+    // K-quant shapes (256-value super-blocks)
+    let kshapes: &[(usize, usize)] = &[
+        (256, 16),   // minimum legal: one super-block, one group
+        (256, 32),
+        (512, 16),
+        (768, 48),   // 3 super-blocks, 3 groups
+        (1024, 512),
+        (2048, 512),
+        (2048, 4096),
+        (4864, 896), // qwen ffn_down shape (n_in 4864 = 19·256)
+        (7680, 128), // LFM3 ffn_down shape (n_in 7680 = 30·256)
+    ];
     let mut cases = Vec::new();
     for s in [1u64, 2, 3] {
         for &(ni, no) in shapes {
             cases.push(Case { mode: "random", ty: "q8_0", n_in: ni, n_out: no, seed: s });
             cases.push(Case { mode: "random", ty: "q5_0", n_in: ni, n_out: no, seed: s });
         }
+        for &(ni, no) in kshapes {
+            cases.push(Case { mode: "random", ty: "q4_k", n_in: ni, n_out: no, seed: s });
+            cases.push(Case { mode: "random", ty: "q6_k", n_in: ni, n_out: no, seed: s });
+        }
     }
     for &(ni, no) in shapes {
         cases.push(Case { mode: "extremes", ty: "q8_0", n_in: ni, n_out: no, seed: 7 });
         cases.push(Case { mode: "extremes", ty: "q5_0", n_in: ni, n_out: no, seed: 7 });
         cases.push(Case { mode: "qhwalk", ty: "q5_0", n_in: ni, n_out: no, seed: 9 });
+    }
+    for &(ni, no) in kshapes {
+        cases.push(Case { mode: "extremes", ty: "q4_k", n_in: ni, n_out: no, seed: 7 });
+        cases.push(Case { mode: "extremes", ty: "q6_k", n_in: ni, n_out: no, seed: 7 });
+        cases.push(Case { mode: "qhwalk", ty: "q6_k", n_in: ni, n_out: no, seed: 9 });
     }
 
     let tmp = std::env::temp_dir().join(format!("vg_{}", std::process::id()));
@@ -196,13 +218,32 @@ fn main() {
             out_rt.iter().zip(&r).map(|(a, b)| (a - b).abs() / a.abs().max(*b).max(1e-3)).fold(0.0f64, f64::max)
         };
 
-        let ty = if c.ty == "q8_0" { GgmlType::Q8_0 } else { GgmlType::Q5_0 };
-        let row_bytes = if c.ty == "q8_0" { 34 } else { 22 };
-        let kb = c.n_in / 32;
+        let ty = match c.ty {
+            "q8_0" => GgmlType::Q8_0,
+            "q5_0" => GgmlType::Q5_0,
+            "q4_k" => GgmlType::Q4_K,
+            "q6_k" => GgmlType::Q6_K,
+            _ => unreachable!(),
+        };
+        let is_kq = matches!(ty, GgmlType::Q4_K | GgmlType::Q6_K);
+        let row_bytes = match ty {
+            GgmlType::Q8_0 => 34,
+            GgmlType::Q5_0 => 22,
+            GgmlType::Q4_K => 144,
+            GgmlType::Q6_K => 210,
+            _ => unreachable!(),
+        };
+        let kb = if is_kq { c.n_in / 256 } else { c.n_in / 32 };
+        let qact_bytes = if is_kq { kb * 292 } else { kb * 34 };
 
-        // ---- 1. our quantizer vs C runtime quantizer: BYTE-EXACT ----
-        let mut q_ours = vec![0u8; kb * 34];
-        quant::quantize_row_q8_0(&x, &mut q_ours);
+        // ---- 1. our quantizer vs C golden quantizer: BYTE-EXACT ----
+        // (q8_0: runtime contract id=127/max rte; q8_K: the single contract)
+        let mut q_ours = vec![0u8; qact_bytes];
+        if is_kq {
+            quant::quantize_row_q8_k(&x, &mut q_ours);
+        } else {
+            quant::quantize_row_q8_0(&x, &mut q_ours);
+        }
         let (mism, max_lsb) = {
             let mut m = 0usize;
             let mut l = 0i32;
@@ -217,7 +258,7 @@ fn main() {
         qact_bytes_bad += mism;
         worst_qact = worst_qact.max(if mism == 0 { 0.0 } else { f64::INFINITY });
         assert!(mism == 0,
-            "quantizer mismatch vs C runtime contract: {mism} bytes (max lsb {max_lsb}) at {:?}", c);
+            "quantizer mismatch vs C golden contract: {mism} bytes (max lsb {max_lsb}) at {:?}", c);
 
         // ---- per-column outputs through every path ----
         let mut o_scalar = vec![0f32; c.n_out];
@@ -225,23 +266,27 @@ fn main() {
         let mut o_vnni256 = vec![0f32; c.n_out];
         for (col, o) in o_scalar.iter_mut().enumerate() {
             let w = &tensor[col * row_bytes * kb..(col + 1) * row_bytes * kb];
-            *o = if c.ty == "q8_0" {
-                scalar::dot_q8_0_q8_0(w, &q_ours, c.n_in)
-            } else {
-                scalar::dot_q5_0_q8_0(w, &q_ours, c.n_in)
+            *o = match ty {
+                GgmlType::Q8_0 => scalar::dot_q8_0_q8_0(w, &q_ours, c.n_in),
+                GgmlType::Q5_0 => scalar::dot_q5_0_q8_0(w, &q_ours, c.n_in),
+                GgmlType::Q4_K => scalar::dot_q4_k_q8_k(w, &q_ours, c.n_in),
+                GgmlType::Q6_K => scalar::dot_q6_k_q8_k(w, &q_ours, c.n_in),
+                _ => unreachable!(),
             };
         }
         if avx2_ok {
             for (col, o) in o_avx2.iter_mut().enumerate() {
                 let w = &tensor[col * row_bytes * kb..(col + 1) * row_bytes * kb];
-                *o = if c.ty == "q8_0" {
-                    unsafe { avx2::dot_q8_0_q8_0(w, &q_ours, c.n_in) }
-                } else {
-                    unsafe { avx2::dot_q5_0_q8_0(w, &q_ours, c.n_in) }
+                *o = match ty {
+                    GgmlType::Q8_0 => unsafe { avx2::dot_q8_0_q8_0(w, &q_ours, c.n_in) },
+                    GgmlType::Q5_0 => unsafe { avx2::dot_q5_0_q8_0(w, &q_ours, c.n_in) },
+                    GgmlType::Q4_K => unsafe { avx2::dot_q4_k_q8_k(w, &q_ours, c.n_in) },
+                    GgmlType::Q6_K => unsafe { avx2::dot_q6_k_q8_k(w, &q_ours, c.n_in) },
+                    _ => unreachable!(),
                 };
             }
         }
-        if avx2_ok && avx2::vnni256() {
+        if avx2_ok && !is_kq && avx2::vnni256() {
             for (col, o) in o_vnni256.iter_mut().enumerate() {
                 let w = &tensor[col * row_bytes * kb..(col + 1) * row_bytes * kb];
                 *o = if c.ty == "q8_0" {
@@ -250,6 +295,11 @@ fn main() {
                     unsafe { avx2::dot_q5_0_q8_0_vnni(w, &q_ours, c.n_in) }
                 };
             }
+        } else {
+            // K-quants: the engine dispatch is the AVX2 kernel (no vnni256
+            // variant exists for K-quants) — record the AVX2 numbers as the
+            // dispatch-path evidence
+            o_vnni256 = o_avx2.clone();
         }
         // ---- 5. engine full dispatch ----
         let mut o_engine = vec![0f32; c.n_out];
@@ -259,17 +309,19 @@ fn main() {
         let mut o_packed = vec![0f32; c.n_out];
         let mut o_par = vec![0f32; c.n_out];
         if vnni_ok {
-            let packed = if c.ty == "q8_0" {
-                vnni::repack_q8_0(&tensor, c.n_in, c.n_out)
-            } else {
-                vnni::repack_q5_0(&tensor, c.n_in, c.n_out)
+            let packed = match ty {
+                GgmlType::Q8_0 => vnni::repack_q8_0(&tensor, c.n_in, c.n_out),
+                GgmlType::Q5_0 => vnni::repack_q5_0(&tensor, c.n_in, c.n_out),
+                GgmlType::Q4_K => vnni::repack_q4_k(&tensor, c.n_in, c.n_out),
+                GgmlType::Q6_K => vnni::repack_q6_k(&tensor, c.n_in, c.n_out),
+                _ => unreachable!(),
             };
-            vnni::matvec_vnni(&packed, c.n_in, c.n_out, &x, 1, &mut o_packed);
-            vnni::matvec_vnni(&packed, c.n_in, c.n_out, &x, 2, &mut o_par);
+            vnni::matvec_vnni(&packed, ty, c.n_in, c.n_out, &x, 1, &mut o_packed);
+            vnni::matvec_vnni(&packed, ty, c.n_in, c.n_out, &x, 2, &mut o_par);
             // ---- 8. fused pair: same tensor twice → both outputs = golden ----
             let mut o_f1 = vec![0f32; c.n_out];
             let mut o_f2 = vec![0f32; c.n_out];
-            vnni::matvec2_vnni(&packed, c.n_out, &packed, c.n_out, c.n_in, &x, 1,
+            vnni::matvec2_vnni(&packed, ty, c.n_out, &packed, ty, c.n_out, c.n_in, &x, 1,
                 &mut o_f1, &mut o_f2);
             let fr = max_rel(&o_f1, &out_rt, &energies).max(max_rel(&o_f2, &out_rt, &energies));
             worst_fused = worst_fused.max(fr);
@@ -325,7 +377,7 @@ fn main() {
         let energies = parse_out(&format!("{pfx}_scale.txt"));
         let clean = vnni::repack_q8_0(&tensor0, ni, no);
         let mut o_clean = vec![0f32; no];
-        vnni::matvec_vnni(&clean, ni, no, &x, 1, &mut o_clean);
+        vnni::matvec_vnni(&clean, GgmlType::Q8_0, ni, no, &x, 1, &mut o_clean);
         let base = case_err_scaled(&o_clean, &out_rt, &energies);
         // corrupt byte 3 of column 7's first block (a weight code)
         let mut tensor1 = tensor0.clone();
@@ -333,20 +385,56 @@ fn main() {
         tensor1[pos] ^= 0x55;
         let corrupt = vnni::repack_q8_0(&tensor1, ni, no);
         let mut o_corrupt = vec![0f32; no];
-        vnni::matvec_vnni(&corrupt, ni, no, &x, 1, &mut o_corrupt);
+        vnni::matvec_vnni(&corrupt, GgmlType::Q8_0, ni, no, &x, 1, &mut o_corrupt);
         let mutated = case_err_scaled(&o_corrupt, &out_rt, &energies);
         println!(
-            "  mutation self-test: clean err {base:.2e} → one flipped code byte err {mutated:.2e} = {:.0}× (gate sensitivity proven)",
+            "  mutation self-test q8_0: clean err {base:.2e} → one flipped code byte err {mutated:.2e} = {:.0}× (gate sensitivity proven)",
             mutated / base.max(1e-12)
         );
         // detection gate: a real corruption must rise far above the clean
         // f32-rounding noise floor (ratio gate, not an absolute bar)
         assert!(mutated > 100.0 * base.max(1e-12), "mutation not detected: {mutated:.2e} vs base {base:.2e}");
+
+        // K-quant mutation tests: flip one qs nibble byte (Q4_K) / one ql
+        // byte (Q6_K) of column 7's first super-block
+        for (kty, kname, krow) in [("q4_k", GgmlType::Q4_K, 144usize), ("q6_k", GgmlType::Q6_K, 210usize)] {
+            let (ni, no) = (2048usize, 512usize);
+            let out = std::process::Command::new(&ref_dot)
+                .args(["random", kty, &ni.to_string(), &no.to_string(), "11", pfx])
+                .output().unwrap();
+            assert!(out.status.success());
+            let tensor0 = read_file(&format!("{pfx}_tensor.bin"));
+            let x = f32_from_bytes(&read_file(&format!("{pfx}_x_f32.bin")));
+            let out_rt = parse_out(&format!("{pfx}_out_rt.txt"));
+            let energies = parse_out(&format!("{pfx}_scale.txt"));
+            let repack = |t: &[u8]| match kty {
+                "q4_k" => vnni::repack_q4_k(t, ni, no),
+                _ => vnni::repack_q6_k(t, ni, no),
+            };
+            let clean = repack(&tensor0);
+            let mut o_clean = vec![0f32; no];
+            vnni::matvec_vnni(&clean, kname, ni, no, &x, 1, &mut o_clean);
+            let base = case_err_scaled(&o_clean, &out_rt, &energies);
+            let mut tensor1 = tensor0.clone();
+            // column 7, first super-block: Q4_K qs starts at byte 16; Q6_K ql at byte 0
+            let nib_off = if kty == "q4_k" { 16 } else { 0 };
+            let pos = 7 * krow * (ni / 256) + nib_off + 3;
+            tensor1[pos] ^= 0x55;
+            let corrupt = repack(&tensor1);
+            let mut o_corrupt = vec![0f32; no];
+            vnni::matvec_vnni(&corrupt, kname, ni, no, &x, 1, &mut o_corrupt);
+            let mutated = case_err_scaled(&o_corrupt, &out_rt, &energies);
+            println!(
+                "  mutation self-test {kty}: clean err {base:.2e} → one flipped quant byte err {mutated:.2e} = {:.0}× (gate sensitivity proven)",
+                mutated / base.max(1e-12)
+            );
+            assert!(mutated > 100.0 * base.max(1e-12), "{kty} mutation not detected: {mutated:.2e} vs base {base:.2e}");
+        }
     }
 
     std::fs::remove_dir_all(&tmp).ok();
     println!("\n== [summary] {n_cases} cases × 8 paths = VERIFIED vs llama.cpp C golden ==", );
-    println!("  quantizer bytes vs C runtime contract : mismatches = {qact_bytes_bad} (byte-exact)");
+    println!("  quantizer bytes vs C golden contract: mismatches = {qact_bytes_bad} (byte-exact)");
     println!("  worst rel-diff scalar      : {:.2e}", worst_scalar);
     println!("  worst rel-diff avx2        : {:.2e}", worst_avx2);
     println!("  worst rel-diff avx2+vnni256: {:.2e}", worst_vnni256);

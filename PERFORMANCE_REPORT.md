@@ -1,6 +1,6 @@
 # llama.rs — Phase 6.1–6.3 Performance Engineering Report (rev 3)
 
-**Scope:** profiling infrastructure, scheduling experiments, **AVX-512 VNNI INT8 packed backend** (renamed from "AMX INT8 backend" — see the rev-2 note), and — **rev 3 — the independent verification campaign** of the VNNI path (C-golden differential harness, dispatch safety, matched prefill/decode benchmark) requested in review.
+**Scope:** profiling infrastructure, scheduling experiments, **AVX-512 VNNI INT8 packed backend** (renamed from "AMX INT8 backend" — see the rev-2 note), the **rev-3 independent verification campaign** of the VNNI path (C-golden differential harness, dispatch safety, matched prefill/decode benchmark), and — **rev 4 (Phase 6.4) — the K-quant packed path**: Q4_K/Q6_K repacked to the VNNI format, every LFM3 matvec routed through the packed dispatch, and the first decode result **above llama.cpp** (LFM3 tg = 102 %).
 **Machine:** 2 vCPU Xeon (Sapphire Rapids class) @ 3.2 GHz KVM guest, AVX-512 + AVX512-VNNI + AMX INT8/BF16 (OS-enabled, XCR0 bits 17/18 verified), 504 MB L3, DRAM ceiling ≈ 14–16 GB/s sustained at 2 threads for one linear stream.
 **Baseline at phase start (rev-1 measurements):** LFM3-1.7B 8.5–8.9 tok/s · Qwen2.5-0.5B 9.2–9.5 tok/s (llama.cpp b12502 references: 10.7–12.0 and 29.4–30.0 decode).
 **No HTTP/server work was done — inference performance only, per the phase contract.**
@@ -17,6 +17,20 @@ Review verdict was: verify correctness of the VNNI path first, then focus on the
 4. **CPU feature dispatch verified:** Rust `cpuid` detection cross-checked against `/proc/cpuinfo` (avx512_vnni, amx_int8: MATCH); `repack_tensor_gated(cpu_ok=false)` returns `None` for every type/shape combination (the machine-without-AVX512 simulation → AVX2 fallback, no panic, no AVX-512 instruction reached); end-to-end `LLAMA_RS_VNNI=0` vs `=1` on the real Qwen model: **top-1 token and top-5 ranking identical** (logit deltas ~0.25% — f32 accumulation-order differences compounding through 24 layers, benign).
 5. **Matched benchmark re-run with exact-matched prompt lengths** (llama-bench `-p 55/54` per model tokenizer, our natural prompt tokenizes to exactly 55/54): decode LFM3 **81%**, Qwen **74%**; prefill 10%/15% (llama.cpp batches, we are token-by-token — algorithmic, not kernel). Fresh A/B: the packed path alone lifts Qwen decode **12.90 → 23.38 tok/s (+81%)**.
 6. **All tests re-run fresh at this state:** 28 workspace tests green, parity **16/16** vs llama.cpp, golden sweep all gates green.
+
+---
+
+## Revision note (rev 4, 2026-11-25) — Phase 6.4: K-quant VNNI repack → LFM3 decode at 102 % of llama.cpp
+
+The review's ranked next step ("K-quant repack, the LFM3 decode gap is largely this; the verification harness extends directly") was executed in full:
+
+1. **Q4_K and Q6_K repacked to the packed-VNNI format** (`vnni.rs::repack_q4_k/repack_q6_k`) — the same construction as llama.cpp's `pack_B<block_q4_K>`/`pack_B<block_q6_K>` (tile sizes 2368 B = 16·144+64 and 3360 B = 16·210, **identical to llama.cpp's TILE_SIZE**). Nibbles stay NIBBLE-PACKED (4.5/6.5625 bpw preserved — the packed path reads ~2.8 % more bytes on Q4_K tiles, zero on Q6_K), and the kernels unpack in-register exactly like `tinygemm_kernel_vnni<q8_K, q4_K/q6_K>`: `dpbusd` over in-register nibbles, integer per-group scale multiply, the **min term via `dpwssds`**, and the q6 **(q−32) offset compensated from the activation bsums×32**. Activations quantize to q8_K (the K-quant vec_dot_type, `quantize_row_q8_K`) — byte-exact vs the C contract (below). A real repack bug (6-bit values OR-ed into a nibble pair without masking) was caught by the differential tests and fixed before anything was benchmarked.
+2. **The verification harness extended directly, as predicted**: `ref_dot.c` gained transcriptions of `quantize_row_q8_K_ref` + `ggml_vec_dot_q4_K_q8_K_generic` + `ggml_vec_dot_q6_K_q8_K_generic`; the golden sweep grew from 72 to **153 cases × 8 paths — ALL GREEN** (worst packed-path error 1.15e-7 of term energy; q8_K quantizer **byte-exact**, 0 mismatches; mutation sensitivity q4_k 5115×, q6_k 3376×). Six new test suites in `tests/vnni.rs` (randomized Q4_K/Q6_K vs the AVX2 reference, min-shape/extreme-scale/min-zero edges, K-quant fused pair, 2-thread determinism, activation edges) — 34 workspace tests green; parity **16/16** re-run at the final state.
+3. **Load-time discovery fixed by profiling**: only the fused gate+up pair had ever been routed through the packed dispatch — LFM3's q/k/v, attn_gate/o, conv in/out_proj, ffn_down and the output head still ran the AVX2 kernels (≈520 MB/token of traffic). All of them now route through the packed dispatch (`pmv`/`pmv2`), which now also records the per-op profile rows itself (packed branch only — no double counting with the AVX2 fallback).
+4. **Glue trim**: the packed path's per-matvec activation-quantization allocations (154 Vecs/token) moved to a process-wide scratch free-list (`vnni.rs::take_q`).
+5. **Result (matched campaign, 5-rep medians, same CPU/-t 2, exact-matched prompt lengths):** LFM3 decode **12.02 tok/s vs llama.cpp 11.74 = 102 %** (runs 11.54–12.49); Qwen decode 23.86 vs 30.34 = 79 %; prefill 14 % / 16 % (token-by-token vs llama.cpp's ubatch — batched prefill is the ranked next step, unchanged). Same-binary A/B (`LLAMA_RS_VNNI=0`): LFM3 8.85 → 12.02 (**+36 % from the packed path alone**), Qwen 13.64 → 23.86.
+6. **Memory (honest note):** the packed map co-resides with the original GGUF buffer, so llama.rs now holds ~2× model bytes in RAM during inference — the same trade llama.cpp's AMX repack makes. On this 4 GB guest that required the parity script to serialize the llama.cpp-server and llama.rs phases (both sides still computed on the same model/prompts; the comparison semantics are unchanged). A file-backed lazy loader (read tensors from the GGUF on demand, keep only non-repacked bytes) is the ranked follow-up — it would cut steady-state memory below even llama.cpp's.
+7. TSC-timing caveat (rev 2, §1.2) unchanged; every number above is median-of-5 process repetitions vs llama-bench's mean of 5 internal reps, both sides fresh in the same session.
 
 ---
 
@@ -127,6 +141,15 @@ The packed VNNI path is the default for Q8_0/Q5_0 tensors because the same-binar
 | Qwen2.5-0.5B Q4_K_M | **prefill (pp)** | 24.45 tok/s (5 runs: 23.57–24.96) | 157.95 tok/s | **15 %** |
 | Qwen2.5-0.5B Q4_K_M | **decode (tg)** | 23.77 tok/s (5 runs: 23.17–24.37) | 31.98 tok/s | **74 %** |
 
+**Rev 4 (Phase 6.4, same conditions, fresh campaign):**
+
+| Model | Phase | llama.rs (K-quant VNNI on) | llama.cpp b12502 | ratio |
+|---|---|---|---|---|
+| LFM3-1.7B Q4_K_M | **prefill (pp)** | 12.06 tok/s (5 runs: 11.76–12.27) | 88.94 tok/s | **14 %** |
+| LFM3-1.7B Q4_K_M | **decode (tg)** | **12.02 tok/s** (5 runs: 11.54–12.49) | 11.74 tok/s | **102 %** |
+| Qwen2.5-0.5B Q4_K_M | **prefill (pp)** | 24.94 tok/s (5 runs: 22.64–26.47) | 154.91 tok/s | **16 %** |
+| Qwen2.5-0.5B Q4_K_M | **decode (tg)** | 23.86 tok/s (5 runs: 22.99–25.02) | 30.34 tok/s | **79 %** |
+
 **Same-binary A/B of the packed VNNI path** (`LLAMA_RS_VNNI=0`, 5 reps, medians, rev-3 fresh run):
 
 | Model | tg (packed VNNI on) | tg (off → AVX2 path) | effect | pp (on/off) |
@@ -148,9 +171,9 @@ The packed VNNI path is the default for Q8_0/Q5_0 tensors because the same-binar
 
 ## 5. Validation gates (all re-run at the rev-3 final state)
 
-1. **C-golden differential sweep: ALL GATES GREEN** (rev 3, `vnni_golden` example) — 72 cases × 8 paths vs llama.cpp's transcribed kernels; quantizer byte-exact vs the runtime contract; worst path error 1.4e-7 of term energy; mutation sensitivity 7276× noise floor; dispatch gates (cpuinfo cross-check, gated repack → None).
+1. **C-golden differential sweep: ALL GATES GREEN** (rev 4 re-run, `vnni_golden` example) — **153 cases × 8 paths** (Q8_0/Q5_0/Q4_K/Q6_K) vs llama.cpp's transcribed kernels; quantizers byte-exact (q8_0 runtime contract + q8_K single contract); worst path error 1.15e-7 of term energy; mutation sensitivity 7276× (q8_0), 5115× (q4_k), 3376× (q6_k); dispatch gates (cpuinfo cross-check, gated repack → None).
 2. **Parity suite: 16/16** — tokenizer ids 10/10, top-1 greedy after prefill 4/4, C-reference dequantization 2/2 (Q5_0, Q6_K; max diff 5e-10).
-3. **Workspace tests: 28 passing across 4 integration suites** (gguf synthetic 2, kernel contracts 11, vnni 10 — randomized + edge cases, quant 5).
+3. **Workspace tests: 34 passing across 4 integration suites** (gguf synthetic 2, kernel contracts 11, vnni 16 — randomized + edge cases incl. the six K-quant suites, quant 5).
 4. **Multiple repetitions:** 5-rep benchmark campaign with medians and all runs listed; 5-rep same-binary A/B; kernel benches 15 reps; llama-bench 5 internal reps.
 5. **No regression hidden by averaging:** every change gated on the parity suite; A/B comparisons through the same binary (`LLAMA_RS_VNNI`, `LLAMA_RS_SLOT`, `LLAMA_RS_SPLIT`).
 6. Failed experiments are documented in §2.1/§2.2 rather than silently dropped.
@@ -178,9 +201,9 @@ bash scripts/profile_decode.sh            # per-op tables + kernel micro-bench
 LLAMA_RS_PROF=1 ./target/release/llama-rs-cli -m <model> --mode bench -p "The capital of France is" -n 48 -t 2
 ```
 
-## 7. Next steps (ranked by measured gap — verification phase complete, optimization unlocked)
+## 7. Next steps (ranked by measured gap — after Phase 6.4)
 
-1. **K-quant repack (Q4_K/Q5_K/Q6_K) to the packed VNNI format** — the LFM3 decode gap is largely this (llama.cpp's `pack_qs<block_q4_K>`-style layout with per-sub-block scales; mmq.cpp 1574–1980 hold the kernels); also Qwen's ffn_down. The verification harness of §3.4 extends directly (ref_dot.c gains Q4_K/Q6_K golden dots).
-2. **Batched prefill (M>1)** — the largest measured gap (pp 10 % / 15 %): process the prompt in ubatches with a GEMM-style path. This is also the prerequisite for a genuine AMX-tile backend (tiles need M>1; the CPUID/XCR0 groundwork is already in place and validated).
-3. Trim the serial glue — scratch-buffer reuse for the ~170 activation-quantize allocations per decode token + logits buffer reuse (~3 ms/token measured).
+1. **Batched prefill (M>1)** — now the dominant measured gap by far (pp 14 % / 16 %): process the prompt in ubatches with a GEMM-style path. This is also the prerequisite for a genuine AMX-tile backend (tiles need M>1; the CPUID/XCR0 groundwork is already in place and validated). LFM3 decode at 102 % shows the packed M=1 route is done; Qwen decode (79 %) needs the remaining per-op overheads, likely a graph-style fused executor.
+2. **File-backed lazy loader** — read tensors from the GGUF on demand at load, keep only non-repacked bytes resident: cuts steady-state memory from ~2× model (packed map + original buffer, same trade llama.cpp's AMX repack makes) to ~1.1× model, below even llama.cpp's footprint, and removes the co-residency constraint the parity script now works around.
+3. Remaining glue (~4 ms/token LFM3): swiglu/rmsnorm/attention scratch reuse, W::get name formatting per token.
 4. Hardening: `catch_unwind` job-failure flag in the pool.

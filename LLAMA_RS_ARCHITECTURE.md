@@ -13,7 +13,7 @@
 | GGUF reader | `ggml/src/gguf.cpp`, `ggml-common.h` | `crates/llama-gguf` | unchanged |
 | Tensor types/quant blocks | `ggml-common.h` (block_q*_K) | `crates/llama-quant` | unchanged |
 | Compute ops | `ggml/src/ggml-cpu/ops.cpp` | `llama-core` (lib.rs ops + quant matvec) | `crates/llama-kernels` + SIMD — **done in Phase 6** |
-| Compute kernels (SIMD) | `ggml/src/ggml-cpu/arch/x86/quants.c` + `vec.cpp` | `crates/llama-kernels/src/avx2.rs` (+ `avx512.rs` experiment) | same + `vnni.rs` (repacked AVX-512 VNNI INT8, Phase 6.3; **AMX tile instructions not executed** — capability detection only) |
+| Compute kernels (SIMD) | `ggml/src/ggml-cpu/arch/x86/quants.c` + `vec.cpp` | `crates/llama-kernels/src/avx2.rs` (+ `avx512.rs` experiment) | same + `vnni.rs` (repacked AVX-512 VNNI INT8 for **Q8_0/Q5_0/Q4_K/Q6_K**, Phases 6.3/6.4; **AMX tile instructions not executed** — capability detection only) |
 | Activation quantizers | `ggml-quants.c quantize_row_q8_0/q8_K` + arch/x86 fast path | `crates/llama-kernels/src/quant.rs` | unchanged |
 | Threadpool | `ggml/src/ggml-cpu/ggml-cpu.c` (ggml_threadpool) | `crates/llama-kernels/src/pool.rs` (persistent workers, spin-then-park) | unchanged |
 | Backend/scheduling | `ggml/src/ggml-backend.cpp` | — (not needed for CPU in v0) | `crates/llama-backend` |
@@ -102,13 +102,13 @@ llama.rs/
 3. **tokenizer-ids**: the same list of texts through the llama.cpp server `/tokenize` and through `llama-rs-cli tokenize` → compare id sequences (must match 100%).
 4. **greedy-generation**: `llama-completion -m model -p prompt -n N` (no random sampling) vs `llama-rs-cli generate` → compare text/ids. A greedy match implies a match of: embedding + all ops + KV + sampler argmax.
 5. **Dequantization**: `ref_q5.c`/`ref_q6.c` (transcribed from ggml-quants.c itself) compare dequantized values from a real file column by column.
-6. **C-golden VNNI differential (rev 3)**: `tests/parity/ref_dot.c` + `crates/llama-kernels/examples/vnni_golden.rs` — llama.cpp's own quantizers (ref + runtime contracts) and generic vec_dots re-implemented in C as the golden; 72 cases (random ×3 seeds ×8 shapes + extremes + qh-walk) × 8 paths (scalar/AVX2/VNNI256/engine/packed 1t/2t/fused); quantizer gate is BYTE-exact vs the runtime contract, path gates at 1e-7 of term energy; mutation sensitivity self-test (one flipped code byte = 7276× the noise floor); CPU dispatch gates (cpuid vs /proc/cpuinfo cross-check, `repack_tensor_gated(false)` → fallback) and end-to-end `LLAMA_RS_VNNI=0/1` top-1 identity.
+6. **C-golden VNNI differential (rev 3/4)**: `tests/parity/ref_dot.c` + `crates/llama-kernels/examples/vnni_golden.rs` — llama.cpp's own quantizers (q8_0 ref + runtime contracts, q8_K single contract) and generic vec_dots (q8_0/q5_0/q4_K/q6_K) re-implemented in C as the golden; **153 cases** (random ×3 seeds × shapes + extremes + qh-walks, simple and K-quant) × 8 paths (scalar/AVX2/VNNI256/engine/packed 1t/2t/fused); quantizer gates are BYTE-exact, path gates at 1e-7 of term energy; mutation sensitivity self-tests (one flipped byte: q8_0 = 7276×, q4_k = 5115×, q6_k = 3376× the noise floor); CPU dispatch gates (cpuid vs /proc/cpuinfo cross-check, `repack_tensor_gated(false)` → fallback) and end-to-end `LLAMA_RS_VNNI=0/1` top-1 identity.
 7. **bifurcation search** on any divergence: print the first-token logits and compare (future tool).
 
 ## 6) v0 Limits (not yet ported — with full honesty)
 
 - Throughput (matched 2-thread benchmark, medians): LFM3-1.7B decode 8.5 vs llama.cpp 11.8 tok/s (72%); Qwen2.5-0.5B decode 23.6 vs 29.7 (80%). Prefill, measured separately: llama.rs 8.8 / 24.8 vs llama.cpp 99.8 / 159.8 tok/s — llama.rs prefills token-by-token while llama.cpp batches the whole prompt (M>1, where its real AMX tile kernels run); batched prefill is the largest remaining gap.
-- llama.cpp's simple-quant decode tensors (Q8_0 head, Q5_0 attn) run on its AMX backend's **repacked-VNNI M=1 route** — not on tile instructions; that route is now ported here (`llama-kernels/src/vnni.rs`).
+- llama.cpp's simple-quant decode tensors (Q8_0 head, Q5_0 attn) run on its AMX backend's **repacked-VNNI M=1 route** — not on tile instructions; that route is now ported here (`llama-kernels/src/vnni.rs`), extended to the K-quants **Q4_K/Q6_K** (Phase 6.4: nibble-packed tiles identical to llama.cpp's `pack_B` tile sizes, q8_K activations, `dpwssds` min term, bsums×32 offset compensation) — and **every LFM3 matvec now routes through it** (LFM3 decode = 102% of llama.cpp).
 - No HTTP server, no parallel batching, no speculative decoding (Phase 7).
 - No GPU backends. No AMX tile instructions executed (CPUID/XCR0 capability is detected and reported only).
 - Chat template subset (not full jinja): ChatML + LFM3 thinking tags, no tools/vision.

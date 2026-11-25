@@ -22,6 +22,12 @@ check() { # name, ok
 }
 
 echo "== [1] tokenize: llama.rs vs llama.cpp /tokenize (mixed-script/English/symbols) =="
+# NOTE (Phase 6.4): the packed K-quant path doubles llama.rs model memory
+# (original bytes + VNNI-repacked copy — the same trade llama.cpp's AMX
+# repack makes). On this 4 GB guest, llama-server + a 2.2 GB llama.rs CLI
+# no longer fit together, so the reference outputs are collected FIRST,
+# the server is stopped, and only then the llama.rs side runs (same
+# comparison semantics — both sides computed on the same model/text).
 declare -a TEXTS=(
   "Hello world"
   "人工智能是一门构建智能系统的科学"
@@ -34,12 +40,16 @@ for model in "$QWEN" "$LFM"; do
   port=$PORT1
   ( "$LLAMA_BIN/llama-server" -m "$model" --host 127.0.0.1 --port $port -c 2048 -t 2 >/dev/null 2>&1 & )
   sleep 15
+  declare -a REFS=()
   for txt in "${TEXTS[@]}"; do
-    ref=$(curl -s http://127.0.0.1:$port/tokenize -H "Content-Type: application/json" -d "$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$txt")" | python3 -c "import sys,json; print(json.load(sys.stdin)['tokens'])")
+    REFS+=("$(curl -s http://127.0.0.1:$port/tokenize -H "Content-Type: application/json" -d "$(python3 -c "import json,sys; print(json.dumps({'content': sys.argv[1]}))" "$txt")" | python3 -c "import sys,json; print(json.load(sys.stdin)['tokens'])")")
+  done
+  pkill -f "llama-server.*port $port" 2>/dev/null; sleep 4
+  for i in "${!TEXTS[@]}"; do
+    txt="${TEXTS[$i]}"; ref="${REFS[$i]}"
     ours=$("$LLAMA_RS" -m "$model" --mode tokenize --no-bos -p "$txt" -t 1 2>/dev/null | grep -o '\[.*\]')
     if [ "$ref" == "$ours" ]; then check "tokenize [$name] '${txt:0:25}…'" 1; else check "tokenize [$name] '${txt:0:25}…' (ref=$ref ours=$ours)" 0; fi
   done
-  pkill -f "llama-server.*port $port" 2>/dev/null; sleep 2
 done
 
 echo "== [2] distribution after prefill: top-1 match with llama.cpp (greedy) =="
@@ -48,12 +58,17 @@ for model in "$QWEN" "$LFM"; do
   port=$PORT2
   ( "$LLAMA_BIN/llama-server" -m "$model" --host 127.0.0.1 --port $port -c 2048 -t 2 >/dev/null 2>&1 & )
   sleep 15
-  for prompt in "The capital of France is" "The" ; do
-    ref_tok=$(curl -s http://127.0.0.1:$port/v1/completions -H "Content-Type: application/json" -d "$(python3 -c "import json,sys; print(json.dumps({'prompt': sys.argv[1], 'max_tokens': 1, 'temperature': 0, 'logprobs': 1}))" "$prompt")" | python3 -c "import sys,json; print(repr(json.load(sys.stdin)['choices'][0]['text']))")
+  declare -a PREFS=( "The capital of France is" "The" )
+  declare -a REFS=()
+  for prompt in "${PREFS[@]}"; do
+    REFS+=("$(curl -s http://127.0.0.1:$port/v1/completions -H "Content-Type: application/json" -d "$(python3 -c "import json,sys; print(json.dumps({'prompt': sys.argv[1], 'max_tokens': 1, 'temperature': 0, 'logprobs': 1}))" "$prompt")" | python3 -c "import sys,json; print(repr(json.load(sys.stdin)['choices'][0]['text']))")")
+  done
+  pkill -f "llama-server.*port $port" 2>/dev/null; sleep 4
+  for i in "${!PREFS[@]}"; do
+    prompt="${PREFS[$i]}"; ref_tok="${REFS[$i]}"
     ours_tok=$("$LLAMA_RS" -m "$model" --mode debug --no-bos -p "$prompt" -t 1 2>/dev/null | grep top1 | python3 -c "import sys; line=sys.stdin.read(); import re; m=re.search(r'text=\"(.*?)\"', line); print(repr(m.group(1)) if m else 'NONE')")
     if [ "$ref_tok" == "$ours_tok" ]; then check "top1-greedy [$name] after '$prompt'" 1; else check "top1-greedy [$name] after '$prompt' (cpp=$ref_tok rs=$ours_tok)" 0; fi
   done
-  pkill -f "llama-server.*port $port" 2>/dev/null; sleep 2
 done
 
 echo "== [3] dequantization: llama.rs vs C reference (original ggml code) =="
