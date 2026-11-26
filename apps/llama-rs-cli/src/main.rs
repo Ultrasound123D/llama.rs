@@ -310,10 +310,13 @@ fn print_kstats_summary(n_tok: usize) {
     let wall_us = ns(ks::MATVEC_WALL_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
     let caller_band_us = ns(ks::CALLER_BAND_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
     let n_jobs = ks::WAKE_JOBS.load(std::sync::atomic::Ordering::Relaxed) as f64 / n;
+    let slot_jobs = ks::SLOT_JOBS.load(std::sync::atomic::Ordering::Relaxed) as f64 / n;
+    let slot_wait_us = ns(ks::SLOT_WAIT_TICKS.load(std::sync::atomic::Ordering::Relaxed)) / 1e3 / n;
     println!(
-        "kstats: {matvecs:.0} matvecs/token | matvec wall {wall_us:.1} µs/tok | quantize {quant:.1} µs/tok ({q_allocs:.0} allocs, {q_alloc_kb:.0} KB) | dots {dot:.1} µs CPU/tok (both threads) | caller band {caller_band_us:.1} µs/tok | pool enqueue {enq:.1} + caller wait {wait:.1} µs/tok | worker wake {wake_us:.2} µs avg over {n_jobs:.0} jobs/token ({parks} parks / {spins} spin-hits; caller barrier: {c_spin_wins} spin-wins / {c_parks} parks)",
+        "kstats: {matvecs:.0} matvecs/token | matvec wall {wall_us:.1} µs/tok | quantize {quant:.1} µs/tok ({q_allocs:.0} allocs, {q_alloc_kb:.0} KB) | dots {dot:.1} µs CPU/tok (both threads) | caller band {caller_band_us:.1} µs/tok | pool enqueue {enq:.1} + caller wait {wait:.1} µs/tok | worker wake {wake_us:.2} µs avg over {n_jobs:.0} jobs/token ({parks} parks / {spins} spin-hits; caller barrier: {c_spin_wins} spin-wins / {c_parks} parks) | slot: {slot_jobs:.0} jobs/tok, slot-join wait {slot_wait_us:.1} µs/tok",
         matvecs = matvecs, wall_us = wall_us, quant = quant, q_allocs = q_allocs, q_alloc_kb = q_alloc_kb,
         dot = dot, caller_band_us = caller_band_us, enq = enq, wait = wait, wake_us = wake_us,
         n_jobs = n_jobs, parks = parks, spins = spins, c_spin_wins = c_spin_wins, c_parks = c_parks,
+        slot_jobs = slot_jobs, slot_wait_us = slot_wait_us,
     );
 }

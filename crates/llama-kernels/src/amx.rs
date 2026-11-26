@@ -100,6 +100,50 @@ pub fn amx_ready() -> bool {
     })
 }
 
+/// Phase 8: B-unpack hoisting — how many 32-row blocks share one
+/// unpacked B tile pair (tmm0/tmm1 stay live across the row-block loop).
+/// 4 keeps the per-(i,k) hot set (2 unpacked B tiles + the row-blocks'
+/// Sumi/dumps) inside one 48 KB L1D; the Phase 7 nb-major attempt at 16
+/// row-blocks thrashed L1 (-36%). `LLAMA_RS_AMX_HOIST=0` restores the
+/// Phase 7 block-major order (same-binary A/B).
+const M_HOIST_MAX: usize = 4;
+
+/// Row-blocks hoisted per B tile pass at runtime (`LLAMA_RS_AMX_MHOIST`,
+/// default 4; 1 = the Phase 7 per-block loop shape with the Phase 8
+/// column-major thread split only).
+fn m_hoist() -> usize {
+    static E: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("LLAMA_RS_AMX_MHOIST")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, M_HOIST_MAX)
+    })
+}
+
+/// Phase 8 verdict (measured, this session, LFM3-1.7B Q4_K_M, 2 threads):
+/// the B-unpack hoisting and the column-major thread split are both
+/// LOSERS vs the Phase 7 row-major split and are disabled by default —
+/// kept runnable behind `LLAMA_RS_AMX_HOIST=1` + `LLAMA_RS_AMX_MHOIST`
+/// for A/B. Evidence (gemmbench, M=512, us/tok; Phase 7 = row split):
+///   gate+up Q4_K 152.9 (P7) | 160.9 (P7 loop + col split) | 172.0 (hoist 4)
+///   ffn_down Q6_K 131.9 (P7) | 139.0 (col split)           | 205.2 (hoist 4)
+///   output head  339.0 (P7) | 383.2 (col split)           | 386.2 (hoist 4)
+///   Qwen ffn_down 31.2 (P7) | 41.5 (col split)            | 54.5 (hoist 4)
+/// Root cause of the Phase 7 row-split's win: with mbi-major traversal
+/// both threads consume the SAME B tiles concurrently (thread0 at
+/// (mbi=0,nbi), thread1 at (mbi=2,nbi)) — one L3 fill serves both L2's;
+/// the column split makes the misses disjoint. The hoist additionally
+/// serializes the tmm4-7 dump/scale chains per row-block.
+fn hoist_enabled() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| match std::env::var("LLAMA_RS_AMX_HOIST") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    })
+}
+
 /// 64-byte tile config, identical to llama.cpp's `ggml_tile_config_init`:
 /// TMM0/1 = B tiles (8 rows x 64 B), TMM2/3 = A tiles (16 x 32 B),
 /// TMM4-7 = C tiles (16 x 64 B = 16 int32).
@@ -438,6 +482,36 @@ struct AmxBufs {
     s7: Al64<[i32; 256]>,
 }
 
+/// Phase 8 hoisted-path scratch: the dumps/A/B tiles are reused per
+/// row-block exactly as in `AmxBufs`; the int32 sums are instantiated per
+/// (row-block, {s4,s5,s6,s7}-role) so k-accumulation state persists
+/// across the hoisted row-block loop. 16 x 1 KB = 16 KB per thread.
+struct AmxBufsN {
+    t0: Al64<[u8; 512]>,
+    t1: Al64<[u8; 512]>,
+    t23: Al64<[u8; 512]>,
+    d4: Al64<[u8; 1024]>,
+    d5: Al64<[u8; 1024]>,
+    d6: Al64<[u8; 1024]>,
+    d7: Al64<[u8; 1024]>,
+    s: [[Al64<[i32; 256]>; 4]; 4], // [row-block][s4,s5,s6,s7 roles]
+}
+
+impl AmxBufsN {
+    fn new() -> AmxBufsN {
+        AmxBufsN {
+            t0: Al64([0u8; 512]),
+            t1: Al64([0u8; 512]),
+            t23: Al64([0u8; 512]),
+            d4: Al64([0u8; 1024]),
+            d5: Al64([0u8; 1024]),
+            d6: Al64([0u8; 1024]),
+            d7: Al64([0u8; 1024]),
+            s: std::array::from_fn(|_| std::array::from_fn(|_| Al64([0i32; 256]))),
+        }
+    }
+}
+
 impl AmxBufs {
     fn new() -> AmxBufs {
         AmxBufs {
@@ -456,7 +530,6 @@ impl AmxBufs {
     }
 }
 
-/// One 32-row x 32-col block: for every K super-block i, every sub-group k
 // ---------- driver ----------
 
 /// AMX GEMM entry: `out[m*n_out + c] = <x row m, W col c>` for M >= 2.
@@ -488,6 +561,52 @@ pub fn gemm_amx(packed: &PackedTensor, q: &QBatch, n_threads: usize, out: &mut [
     let out_len = out.len();
     let out_ptr = out.as_mut_ptr();
 
+    if hoist_enabled() {
+        // Phase 8 order: for every 32-column block, unpack the B tiles ONCE
+        // per (super-block i, sub-group k) and stream ALL hoisted row-blocks
+        // through the SAME tmm0/tmm1 — the Phase 7 order re-unpacked (and
+        // re-paid the tileloadd + DRAM bytes) per 32-row block. Threads
+        // split by COLUMN blocks (each streams half the packed weights)
+        // instead of by row blocks (each streamed the FULL matrix).
+        // Per-element arithmetic order (i, k, per-k dump+scale, per-i f32
+        // acc) is unchanged — bit-identical by the same argument as Phase 7.
+        let nb_count = n_out / (2 * TILE_N);
+        debug_assert_eq!(n_out % (2 * TILE_N), 0, "AMX GEMM requires n_out % 32 == 0");
+        let mb_total = m_rows.div_ceil(2 * TILE_M);
+        let mh = m_hoist();
+        let m_groups = mb_total.div_ceil(mh);
+
+        let run = |n_lo: usize, n_hi: usize| unsafe {
+            tile_config_init();
+            let mut bufs = AmxBufsN::new();
+            let out_slice = std::slice::from_raw_parts_mut(out_ptr, out_len);
+            for nb in n_lo..n_hi {
+                for mg in 0..m_groups {
+                    let mut mbs = [(usize::MAX, 0usize); M_HOIST_MAX];
+                    for (j, e) in mbs.iter_mut().enumerate() {
+                        let mbi = mg * mh + j;
+                        if j < mh && mbi < mb_total {
+                            let m_start = mbi * (2 * TILE_M);
+                            *e = (m_start, m_rows.saturating_sub(m_start).min(2 * TILE_M));
+                        }
+                    }
+                    amx_nb_block(ty, &packed.data, q, out_slice, ldc, kb, tile_bytes, nb, &mbs, &mut bufs);
+                }
+            }
+        };
+
+        let n_threads = n_threads.max(1);
+        if n_threads > 1 && nb_count >= 2 {
+            let mid = (nb_count / 2).clamp(1, nb_count - 1);
+            let caller = move || run(0, mid);
+            let worker = move || run(mid, nb_count);
+            pool::par_chunks2(caller, worker);
+        } else {
+            run(0, nb_count);
+        }
+        return;
+    }
+
     // 32-row x 32-col blocks; tails (m_size < 32) handled inside the kernel
     let mb = m_rows.div_ceil(2 * TILE_M);
     let nb = n_out / (2 * TILE_N);
@@ -514,6 +633,118 @@ pub fn gemm_amx(packed: &PackedTensor, q: &QBatch, n_threads: usize, out: &mut [
         pool::par_chunks2(caller, worker);
     } else {
         run(0, total);
+    }
+}
+
+/// Phase 8 hoisted block kernel: one 32-column block of the GEMM, with
+/// up to M_HOIST 32-row blocks streaming the SAME unpacked B tiles
+/// (tmm0/tmm1 stay live across the row-block loop). The per-element
+/// accumulation chain (i outer, k inner, per-k dump+scale into the
+/// row-block's Sumi, per-i f32 acc) is IDENTICAL to amx_block's, so the
+/// outputs are bit-identical.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,f16c")]
+unsafe fn amx_nb_block(
+    ty: GgmlType,
+    packed: &[u8],
+    q: &QBatch,
+    out: &mut [f32],
+    ldc: usize,
+    kb: usize,
+    tile_bytes: usize,
+    nb: usize,
+    mbs: &[(usize, usize); M_HOIST_MAX], // (m_glob, m_size); inactive tails carry m_size == 0
+    b: &mut AmxBufsN,
+) {
+    let q6 = ty == GgmlType::Q6_K;
+    let n_sub = if q6 { 16 } else { 8 };
+    let scale_off = if q6 { Q6K_OFF_SCALES } else { Q4K_OFF_SCALES };
+    let b0_base = packed.as_ptr().add((nb * 2) * kb * tile_bytes);
+    let b1_base = packed.as_ptr().add((nb * 2 + 1) * kb * tile_bytes);
+    let (c4p, c5p, c6p, c7p) = (
+        b.d4.0.as_mut_ptr(),
+        b.d5.0.as_mut_ptr(),
+        b.d6.0.as_mut_ptr(),
+        b.d7.0.as_mut_ptr(),
+    );
+
+    for i in 0..kb {
+        for k in 0..n_sub {
+            let t0p = b0_base.add(i * tile_bytes);
+            let t1p = b1_base.add(i * tile_bytes);
+            if q6 {
+                unpack_b_q6k(&mut b.t0.0, std::slice::from_raw_parts(t0p, tile_bytes), k);
+                unpack_b_q6k(&mut b.t1.0, std::slice::from_raw_parts(t1p, tile_bytes), k);
+            } else {
+                unpack_b_q4k(&mut b.t0.0, std::slice::from_raw_parts(t0p, tile_bytes), k);
+                unpack_b_q4k(&mut b.t1.0, std::slice::from_raw_parts(t1p, tile_bytes), k);
+            }
+            lo0(b.t0.0.as_ptr(), 64);
+            lo1(b.t1.0.as_ptr(), 64);
+
+            // every hoisted row-block streams the SAME B tiles; the AVX
+            // scale work of block mi overlaps the tile chains of block
+            // mi+1 — the same interleaving contract as the Phase 7 loop
+            // (separating them measured -20%).
+            for (mi, &(m_glob, m_size)) in mbs.iter().enumerate() {
+                if m_size == 0 {
+                    break;
+                }
+                let m0 = m_size.min(TILE_M);
+                let m1 = m_size.saturating_sub(TILE_M);
+                unpack_a(&mut b.t23.0, q, m_glob, i, k, m0, q6);
+                lo2(b.t23.0.as_ptr(), 32);
+                z4();
+                d4();
+                st4(c4p, 64);
+                scale_c(&mut b.s[mi][0].0, &*(c4p as *const [i32; 256]), t0p.add(scale_off), k, m0, k == 0);
+                z6();
+                d6();
+                st6(c6p, 64);
+                scale_c(&mut b.s[mi][2].0, &*(c6p as *const [i32; 256]), t1p.add(scale_off), k, m0, k == 0);
+
+                if m1 != 0 {
+                    unpack_a(&mut b.t23.0, q, m_glob + TILE_M, i, k, m1, q6);
+                    lo3(b.t23.0.as_ptr(), 32);
+                    z5();
+                    d5();
+                    st5(c5p, 64);
+                    scale_c(&mut b.s[mi][1].0, &*(c5p as *const [i32; 256]), t0p.add(scale_off), k, m1, k == 0);
+                    z7();
+                    d7();
+                    st7(c7p, 64);
+                    scale_c(&mut b.s[mi][3].0, &*(c7p as *const [i32; 256]), t1p.add(scale_off), k, m1, k == 0);
+                }
+            }
+        }
+        // f32 epilogue for super-block i
+        let out_ptr = out.as_mut_ptr();
+        let col = nb * 2 * TILE_N;
+        let is_acc = i > 0;
+        let tile0 = std::slice::from_raw_parts(b0_base.add(i * tile_bytes), tile_bytes);
+        let tile1 = std::slice::from_raw_parts(b1_base.add(i * tile_bytes), tile_bytes);
+        for (mi, &(m_glob, m_size)) in mbs.iter().enumerate() {
+            if m_size == 0 {
+                break;
+            }
+            let m0 = m_size.min(TILE_M);
+            let m1 = m_size.saturating_sub(TILE_M);
+            if q6 {
+                acc_c_q6k(out_ptr, ldc, col, &b.s[mi][0].0, q, m_glob, i, tile0, m0, is_acc);
+                acc_c_q6k(out_ptr, ldc, col + TILE_N, &b.s[mi][2].0, q, m_glob, i, tile1, m0, is_acc);
+                if m1 != 0 {
+                    acc_c_q6k(out_ptr, ldc, col, &b.s[mi][1].0, q, m_glob + TILE_M, i, tile0, m1, is_acc);
+                    acc_c_q6k(out_ptr, ldc, col + TILE_N, &b.s[mi][3].0, q, m_glob + TILE_M, i, tile1, m1, is_acc);
+                }
+            } else {
+                acc_c_q4k(out_ptr, ldc, col, &b.s[mi][0].0, q, m_glob, i, tile0, m0, is_acc);
+                acc_c_q4k(out_ptr, ldc, col + TILE_N, &b.s[mi][2].0, q, m_glob, i, tile1, m0, is_acc);
+                if m1 != 0 {
+                    acc_c_q4k(out_ptr, ldc, col, &b.s[mi][1].0, q, m_glob + TILE_M, i, tile0, m1, is_acc);
+                    acc_c_q4k(out_ptr, ldc, col + TILE_N, &b.s[mi][3].0, q, m_glob + TILE_M, i, tile1, m1, is_acc);
+                }
+            }
+        }
     }
 }
 

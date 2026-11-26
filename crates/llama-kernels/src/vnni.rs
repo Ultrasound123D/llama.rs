@@ -749,7 +749,7 @@ pub fn matvec_vnni(
                 let ptr = out.as_mut_ptr();
                 unsafe { vnni_band(packed, &*q, kb, 0, ng, ptr, true) };
             } else {
-                let g_mid = (ng / 2).clamp(1, ng - 1);
+                let g_mid = ((ng as f32 * split_frac()).round() as usize).clamp(1, ng - 1);
                 let ptr = out.as_mut_ptr();
                 let caller = vnni_band_job(packed, &*q, kb, ptr, 0, g_mid, true);
                 let worker = vnni_band_job(packed, &*q, kb, ptr, g_mid, ng, false);
@@ -770,7 +770,7 @@ pub fn matvec_vnni(
                 let ptr = out.as_mut_ptr();
                 unsafe { kq_band(packed, ty, &*q, kb, 0, ng, ptr, true) };
             } else {
-                let g_mid = (ng / 2).clamp(1, ng - 1);
+                let g_mid = ((ng as f32 * split_frac()).round() as usize).clamp(1, ng - 1);
                 let ptr = out.as_mut_ptr();
                 let caller = kq_band_job(packed, ty, &*q, kb, ptr, 0, g_mid, true);
                 let worker = kq_band_job(packed, ty, &*q, kb, ptr, g_mid, ng, false);
@@ -866,6 +866,24 @@ fn split_min_bytes() -> usize {
     *E.get_or_init(|| match std::env::var("LLAMA_RS_SPLIT_MIN") {
         Ok(v) => v.parse().unwrap_or(0),
         Err(_) => 1_500_000,
+    })
+}
+
+/// Phase 8: asymmetric caller/worker band split for the M=1 matvec family.
+/// Measured (this session, LFM3 Q4_K_M, 2 threads): the caller's slot-join
+/// wait is ~9.1 ms/token (~94 µs average late finish of the worker band)
+/// and the caller band runs ~10% slower per group than the worker's —
+/// giving the caller a larger share of the group space equalizes the join.
+/// `LLAMA_RS_SPLIT_FRAC` = the caller's share of the groups (0.5 = even,
+/// the Phase 6-7 behavior).
+fn split_frac() -> f32 {
+    static E: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("LLAMA_RS_SPLIT_FRAC")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.5, 0.75)
     })
 }
 
@@ -977,7 +995,7 @@ pub fn matvec3_vnni(
         let o3 = out3.as_mut_ptr();
         unsafe { band3_any(ty, p1, ng1, p2, ng2, p3, &*q, kb, 0, ng, o1, o2, o3, true) };
     } else {
-        let g_mid = (ng / 2).clamp(1, ng - 1);
+        let g_mid = ((ng as f32 * split_frac()).round() as usize).clamp(1, ng - 1);
         let o1 = out1.as_mut_ptr();
         let o2 = out2.as_mut_ptr();
         let o3 = out3.as_mut_ptr();
@@ -1056,7 +1074,7 @@ pub fn matvec2_vnni(
             unsafe { vnni_band2(p1, ng1, p2, &*q, kb, 0, ng, o1, o2, true) };
         }
     } else {
-        let g_mid = (ng / 2).clamp(1, ng - 1);
+        let g_mid = ((ng as f32 * split_frac()).round() as usize).clamp(1, ng - 1);
         let o1 = out1.as_mut_ptr();
         let o2 = out2.as_mut_ptr();
         let q1: &[u8] = &*q;
@@ -1567,6 +1585,9 @@ pub fn gemm_prepared(
         let ptr = out.as_mut_ptr();
         unsafe { gemm_band(&packed.data, packed.ty, q, kb, 0, ng, ptr, stride, true) };
     } else {
+        // prefill GEMM: keep the EVEN split (the ~94 µs worker lag is
+        // negligible against millisecond bands; the M=1 asymmetry does not
+        // transfer)
         let g_mid = (ng / 2).clamp(1, ng - 1);
         let ptr = out.as_mut_ptr();
         let caller = gemm_band_job(&packed.data, packed.ty, q, kb, ptr, stride, 0, g_mid, true);
@@ -1654,6 +1675,9 @@ pub fn gemm2_prepared(
         let o2 = out2.as_mut_ptr();
         unsafe { gemm2_band(&p1.data, p1.ty, ng1, &p2.data, q, kb, 0, ng, o1, o2, stride1, stride2, true) };
     } else {
+        // prefill GEMM: keep the EVEN split (the ~94 µs worker lag is
+        // negligible against millisecond bands; the M=1 asymmetry does not
+        // transfer)
         let g_mid = (ng / 2).clamp(1, ng - 1);
         let o1 = out1.as_mut_ptr();
         let o2 = out2.as_mut_ptr();
