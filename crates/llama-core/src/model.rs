@@ -423,7 +423,7 @@ struct Lfm3Batch {
     ffni: Vec<f32>,     // M × n_ff   swiglu out
     ffn_out: Vec<f32>,  // M × n_e
     in_proj: Vec<f32>,  // M × 3n_e  shortconv in_proj
-    conv_w: Vec<f32>,   // n_e × (M + d_conv) channel-major window
+    conv_w: Vec<f32>,   // n_e × (M + d_conv + 1) channel-major window (+1 = SIMD pad)
     conv_y: Vec<f32>,   // M × n_e
 }
 
@@ -445,7 +445,7 @@ impl Lfm3Batch {
             ffni: vec![0f32; m_max * n_ff],
             ffn_out: vec![0f32; m_max * n_e],
             in_proj: vec![0f32; m_max * 3 * n_e],
-            conv_w: vec![0f32; n_e * (m_max + d_conv)],
+            conv_w: vec![0f32; n_e * (m_max + d_conv + 1)],
             conv_y: vec![0f32; m_max * n_e],
         }
     }
@@ -490,13 +490,15 @@ impl Lfm3 {
         let conv_state = vec![vec![0f32; n_embd * (l_cache - 1)]; is_recr.iter().filter(|&&r| r).count()];
         let conv_kernels: Vec<Vec<f32>> = (0..n_layer).filter(|&il| is_recr[il]).map(|il| {
             // conv kernel [l_cache, n_embd] F32 — ne[0]=l_cache fastest → channel ch: taps at ch*l_cache+k
+            // Phase 7: stored 8 taps per channel (zero-padded) for the 8-wide
+            // AVX-512 tap-dot kernel.
             let t = gguf.tensor(&format!("blk.{il}.shortconv.conv.weight")).unwrap();
             let data = gguf.tensor_bytes(t);
-            let mut v = vec![0f32; n_embd * l_cache];
+            let mut v = vec![0f32; n_embd * 8];
             for ch in 0..n_embd {
                 for k in 0..l_cache {
                     let o = (ch * l_cache + k) * 4;
-                    v[ch * l_cache + k] = f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                    v[ch * 8 + k] = f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
                 }
             }
             v
@@ -557,6 +559,7 @@ impl Lfm3 {
 
         for il in 0..self.n_layer {
             // ----- norm + attention/conv branch -----
+            // Phase 7: rmsnorm SIMD rows
             let h = rmsnorm(&x, &self.w_attn_norm[il], self.eps);
             let branch: Vec<f32> = if self.is_recr[il] {
                 self.shortconv_block(il, recr_idx, &h);
@@ -572,8 +575,10 @@ impl Lfm3 {
                 branch = rmsnorm(&branch, w, self.eps);
             }
             // residual: x = branch + x (un-normalized prev)
+            // Phase 7: SIMD residual add
             let te0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
-            for i in 0..n_e { x[i] = branch[i] + x[i]; }
+            let (x_lo, br_lo) = (&mut x, &branch);
+            llama_kernels::batch::vec_add(x_lo, br_lo);
             if prof::prof_enabled() {
                 prof::record(pbucket("elementwise"), te0, 0);
                 prof::note_alloc(pbucket("elementwise"), n_e * 4);
@@ -588,11 +593,11 @@ impl Lfm3 {
             // one pool dispatch (packed VNNI pair when available)
             pmv2(&self.gguf, &self.packed, &gate_name, &up_name, &h2, &mut self.s_gate, &mut self.s_up, self.n_threads);
             // swiglu elementwise + ffn_down (packed VNNI dispatch)
+            // Phase 7: AVX-512 row kernel (the audit measured the scalar
+            // f64 exp loop at 8.8% of prefill wall)
             let tw0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
             let n_ff = self.s_gate.len();
-            for i in 0..n_ff {
-                self.s_ffn[i] = silu(self.s_gate[i]) * self.s_up[i];
-            }
+            llama_kernels::batch::silu_mul(&self.s_gate, &self.s_up, &mut self.s_ffn);
             if prof::prof_enabled() {
                 prof::record(prof::bucket("swiglu(elementwise)"), tw0, 0);
                 prof::note_alloc(prof::bucket("swiglu(elementwise)"), 0);
@@ -603,7 +608,9 @@ impl Lfm3 {
                 ffn_out = rmsnorm(&ffn_out, w, self.eps);
             }
             let te1 = if prof::prof_enabled() { prof::tsc() } else { 0 };
-            for i in 0..n_e { x[i] = ffn_out[i] + x[i]; }
+            // Phase 7: SIMD residual add
+            let (x_lo, ffn_lo) = (&mut x, &ffn_out);
+            llama_kernels::batch::vec_add(x_lo, ffn_lo);
             if prof::prof_enabled() {
                 prof::record(pbucket("elementwise"), te1, 0);
             }
@@ -736,13 +743,15 @@ impl Lfm3 {
         for ch in 0..n_e {
             let bx = b[ch] * xx[ch];
             // window: state(6) + bx → sum of taps against the kernel
+            // Phase 7: 8-wide SIMD tap dot (state 6 + bx + zero pad)
             let s_base = ch * d_conv;
-            let k_base = ch * taps;
-            let mut acc = 0f32;
+            let k_base = ch * 8;
+            let mut w8 = [0f32; 8];
             for k in 0..d_conv {
-                acc += kernel[k_base + k] * state[s_base + k];
+                w8[k] = state[s_base + k];
             }
-            acc += kernel[k_base + d_conv] * bx; // last tap = current bx
+            w8[d_conv] = bx;
+            let acc = llama_kernels::batch::conv_tap8(&w8, &kernel[k_base..k_base + 8]);
             y[ch] = c[ch] * acc;
             // state update: shift, then bx as the last element
             for k in 0..d_conv - 1 {
@@ -865,12 +874,12 @@ impl Lfm3 {
                     rmsnorm_inplace(&mut branch[r * n_e..][..n_e], w, eps);
                 }
             }
-            // residual add
+            // residual add — Phase 7 SIMD row adds
             {
                 let (x, br) = (&mut b.x, &b.branch);
                 for r in 0..m {
                     let (xr, brr) = (&mut x[r * n_e..][..n_e], &br[r * n_e..][..n_e]);
-                    for i in 0..n_e { xr[i] += brr[i]; }
+                    llama_kernels::batch::vec_add(xr, brr);
                 }
             }
             if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te1, 0); }
@@ -888,14 +897,14 @@ impl Lfm3 {
                 let (gguf, packed) = (&self.gguf, &self.packed);
                 pgemm2(gguf, packed, &gate_name, &up_name, &b.ffn_h, m, nt, &mut b.gate, &mut b.up);
             }
-            // swiglu rows
+            // swiglu rows — Phase 7 AVX-512 row kernel
             {
                 let tw0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
                 let (g, u, f) = (&b.gate, &b.up, &mut b.ffni);
                 let n_ff = self.n_ff;
                 for r in 0..m {
                     let (gr, ur, fr) = (&g[r * n_ff..][..n_ff], &u[r * n_ff..][..n_ff], &mut f[r * n_ff..][..n_ff]);
-                    for i in 0..n_ff { fr[i] = silu(gr[i]) * ur[i]; }
+                    llama_kernels::batch::silu_mul(gr, ur, fr);
                 }
                 if prof::prof_enabled() { prof::record(pbucket("swiglu(batch)"), tw0, 0); }
             }
@@ -916,7 +925,7 @@ impl Lfm3 {
                 let (x, fo) = (&mut b.x, &b.ffn_out);
                 for r in 0..m {
                     let (xr, fr) = (&mut x[r * n_e..][..n_e], &fo[r * n_e..][..n_e]);
-                    for i in 0..n_e { xr[i] += fr[i]; }
+                    llama_kernels::batch::vec_add(xr, fr);
                 }
             }
             if prof::prof_enabled() { prof::record(pbucket("elementwise(batch)"), te3, 0); }
@@ -1094,25 +1103,22 @@ impl Lfm3 {
 
         // build the channel-major window [ch][d_conv + M]: old state, then
         // this batch's bx values (b·x per row)
+        // Phase 7: state part scalar (6/channel) + bx part through the
+        // tiled transpose-multiply kernel (the per-(ch,r) strided loop was
+        // 606 µs/token of prefill wall — convbench-measured)
         let tc0 = if prof::prof_enabled() { prof::tsc() } else { 0 };
         {
             let state = &self.conv_state[recr_idx];
             let inproj = &b.in_proj[..m * 3 * n_e];
             let conv_w = &mut b.conv_w;
-            let span = d_conv + m;
+            let span1 = d_conv + m + 1;
             for ch in 0..n_e {
-                let wrow = &mut conv_w[ch * span..(ch + 1) * span];
+                let wrow = &mut conv_w[ch * span1..ch * span1 + d_conv];
                 for k in 0..d_conv {
                     wrow[k] = state[ch * d_conv + k];
                 }
-                for r in 0..m {
-                    let bcx = &inproj[r * 3 * n_e..][..3 * n_e];
-                    let (bch, cch, xch) = (&bcx[..n_e], &bcx[n_e..2 * n_e], &bcx[2 * n_e..]);
-                    wrow[d_conv + r] = bch[ch] * xch[ch];
-                    // (c is consumed below; re-read for clarity of the row split)
-                    let _ = cch;
-                }
             }
+            llama_kernels::batch::conv_fill_bx(inproj, n_e, m, d_conv, conv_w, span1);
         }
 
         // convolution: y[r][ch] = c[r][ch] · Σ_j ker[ch][j] · W[ch][r+j]
@@ -1127,11 +1133,11 @@ impl Lfm3 {
                     let bcx = &inproj[r * 3 * n_e..][..3 * n_e];
                     let cch = &bcx[n_e..2 * n_e];
                     for ch in 0..n_e {
-                        let wrow = &conv_w[ch * span..(ch + 1) * span];
-                        let mut acc = 0f32;
-                        for j in 0..taps {
-                            acc += kernel[ch * taps + j] * wrow[r + j];
-                        }
+                        let wrow = &conv_w[ch * (span + 1)..ch * (span + 1) + span + 1];
+                        let acc = llama_kernels::batch::conv_tap8(
+                            &wrow[r..r + 8],
+                            &kernel[ch * 8..ch * 8 + 8],
+                        );
                         *y_out.add(r * n_e + ch) = cch[ch] * acc;
                     }
                 }
@@ -1154,7 +1160,7 @@ impl Lfm3 {
             let conv_w = &b.conv_w;
             let state = &mut self.conv_state[recr_idx];
             for ch in 0..n_e {
-                let wrow = &conv_w[ch * span..(ch + 1) * span];
+                let wrow = &conv_w[ch * (span + 1)..ch * (span + 1) + span];
                 for k in 0..d_conv {
                     state[ch * d_conv + k] = wrow[m + k];
                 }

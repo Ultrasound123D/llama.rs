@@ -71,7 +71,10 @@ pub fn tsc_ghz() -> f64 {
 pub fn init() {
     static I: OnceLock<()> = OnceLock::new();
     I.get_or_init(|| {
-        if !prof_enabled() {
+        // Phase 7: also calibrate for the prefill-only profile
+        // (LLAMA_RS_PROF_PP) — without this the PP table printed with
+        // TSC 0.0 GHz and every bucket row fell out.
+        if !prof_enabled() && std::env::var("LLAMA_RS_PROF_PP").is_err() {
             return;
         }
         let ghz = calibrate();

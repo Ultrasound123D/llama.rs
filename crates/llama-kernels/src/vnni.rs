@@ -1532,6 +1532,20 @@ pub fn gemm_prepared(
     n_threads: usize,
     out: &mut [f32],
 ) {
+    // Phase 7: AMX tile path for M > 1 (Q4_K/Q6_K) — llama.cpp's
+    // tinygemm_kernel_amx, bit-identical accumulation order (see amx.rs).
+    // M == 1 (decode) and non-AMX machines stay on the VNNI GEMM below.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if q.rows() >= 2
+            && matches!(packed.ty, GgmlType::Q4_K | GgmlType::Q6_K)
+            && packed.n_out % (2 * 16) == 0
+            && crate::amx::amx_ready()
+        {
+            crate::amx::gemm_amx(packed, q, n_threads, out);
+            return;
+        }
+    }
     let n_out = packed.n_out;
     debug_assert_eq!(out.len(), q.rows() * n_out);
     let kb = match packed.ty {
@@ -1607,6 +1621,22 @@ pub fn gemm2_prepared(
     debug_assert_eq!(out2.len(), q.rows() * p2.n_out);
     if q.rows() == 0 {
         return;
+    }
+    // Phase 7: AMX tile path per tensor (the shared quantization is kept —
+    // one QBatch, two gemm_amx calls; bit-identical to two VNNI GEMMs).
+    #[cfg(target_arch = "x86_64")]
+    {
+        let amx_ok = crate::amx::amx_ready()
+            && matches!(p1.ty, GgmlType::Q4_K | GgmlType::Q6_K)
+            && p1.ty == p2.ty
+            && p1.n_out % (2 * 16) == 0
+            && p2.n_out % (2 * 16) == 0
+            && q.rows() >= 2;
+        if amx_ok {
+            crate::amx::gemm_amx(p1, q, n_threads, out1);
+            crate::amx::gemm_amx(p2, q, n_threads, out2);
+            return;
+        }
     }
     if kstats::enabled() {
         kstats::MATVECS.fetch_add(2 * q.rows() as u64, std::sync::atomic::Ordering::Relaxed);

@@ -147,6 +147,22 @@ pub fn quantize_row_q8_0(x: &[f32], out: &mut [u8]) {
 pub fn quantize_row_q8_k(x: &[f32], out: &mut [u8]) {
     let k = x.len();
     assert!(k % 256 == 0 && out.len() >= k / 256 * 292, "q8_K quantize sizes");
+    // Phase 7: AVX-512 fast path (value-identical; see the impl notes)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if k >= 256 && have_avx512() {
+            unsafe { quantize_row_q8_k_avx512(x, out) };
+            return;
+        }
+    }
+    quantize_row_q8_k_scalar(x, out);
+}
+
+/// The scalar reference (verbatim `quantize_row_q8_K_ref`) — public for the
+/// value-identity differential test.
+pub fn quantize_row_q8_k_scalar(x: &[f32], out: &mut [u8]) {
+    let k = x.len();
+    assert!(k % 256 == 0 && out.len() >= k / 256 * 292, "q8_K quantize sizes");
     let nb = k / 256;
     for i in 0..nb {
         let xb = &x[i * 256..(i + 1) * 256];
@@ -184,6 +200,85 @@ pub fn quantize_row_q8_k(x: &[f32], out: &mut [u8]) {
         }
         let d = 1.0f32 / iscale;
         out[base..base + 4].copy_from_slice(&d.to_le_bytes());
+    }
+}
+
+// ---------- Phase 7: AVX-512 q8_K quantizer ----------
+// Value-identical to the scalar ref above (the codes feed the int-domain
+// dot family, so bit-equality of the batch/decode paths is preserved):
+//  * amax via reduce_max(|x|) — order-independent, exact
+//  * the signed extreme: the FIRST element reaching amax (the C scan's
+//    `if (a > amax)` keeps the first strict maximum) — reproduced by a
+//    mask scan in vector order
+//  * iscale = -127/max, vq = round-RNE(iscale·v) clamped to <= 127
+//    (roundscale RNE == the magic-number nearest_int on this domain)
+//  * bsums: integer sums — order-independent
+#[cfg(target_arch = "x86_64")]
+fn have_avx512() -> bool {
+    static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *A.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn quantize_row_q8_k_avx512(x: &[f32], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let nb = x.len() / 256;
+    let sign_bit = _mm512_set1_ps(-0.0f32);
+    let v127 = _mm512_set1_epi32(127);
+    for i in 0..nb {
+        let xb = x.as_ptr().add(i * 256) as *const f32;
+        let base = out.as_mut_ptr().add(i * 292);
+        let mut vamax = _mm512_set1_ps(0.0f32);
+        for v in 0..16 {
+            let xv = _mm512_loadu_ps(xb.add(v * 16));
+            let a = _mm512_andnot_ps(sign_bit, xv);
+            vamax = _mm512_max_ps(vamax, a);
+        }
+        let amax = _mm512_reduce_max_ps(vamax);
+        if amax == 0.0 {
+            std::ptr::write_bytes(base, 0, 292);
+            continue;
+        }
+        // the signed extreme: first element with |x| == amax, in scan order
+        let mut max = 0f32;
+        'outer: for v in 0..16 {
+            let xv = _mm512_loadu_ps(xb.add(v * 16));
+            let a = _mm512_andnot_ps(sign_bit, xv);
+            let eq = _mm512_cmpeq_ps_mask(a, _mm512_set1_ps(amax));
+            if eq != 0 {
+                let lane = eq.trailing_zeros() as usize;
+                max = *xb.add(v * 16 + lane);
+                break 'outer;
+            }
+        }
+        let iscale = -127.0f32 / max;
+        let viscale = _mm512_set1_ps(iscale);
+        // quantize each 16-lane vector: code = min(round(iscale·v), 127);
+        // vpmovdb packs the 16 i32 codes to 16 s8 bytes directly
+        for v in 0..16 {
+            let xv = _mm512_loadu_ps(xb.add(v * 16));
+            let vq = _mm512_roundscale_ps(
+                _mm512_mul_ps(xv, viscale),
+                _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+            );
+            let qi = _mm512_min_epi32(_mm512_cvtps_epi32(vq), v127);
+            let qs8 = _mm512_cvtepi32_epi8(qi); // 16 bytes in low 128 bits
+            _mm_storeu_si128(base.add(4 + v * 16) as *mut __m128i, qs8);
+        }
+        // bsums: 16 groups of 16 s8 codes — exact integer sums (order-free)
+        for j in 0..16 {
+            let mut sum = 0i32;
+            for q in 0..16 {
+                sum += *base.add(4 + j * 16 + q) as i8 as i32;
+            }
+            let bsum = sum as i16;
+            std::ptr::copy_nonoverlapping(bsum.to_le_bytes().as_ptr(), base.add(260 + 2 * j), 2);
+        }
+        let d = 1.0f32 / iscale;
+        std::ptr::copy_nonoverlapping(d.to_le_bytes().as_ptr(), base, 4);
     }
 }
 

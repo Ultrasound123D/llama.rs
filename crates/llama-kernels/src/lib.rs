@@ -31,6 +31,11 @@ pub mod batch;
 /// AVX-512 VNNI instructions only — no AMX tile instructions. See the module
 /// docs for the naming correction note.
 pub mod vnni;
+/// Phase 7 AMX tile GEMM for batched prefill (M > 1) — the real tile
+/// instructions this time (LDTILECFG/TILELOADD/TDPBSSD/TILESTORED), after
+/// the Linux XTILEDATA permission syscall. M=1 decode stays on VNNI.
+#[cfg(target_arch = "x86_64")]
+pub mod amx;
 
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;

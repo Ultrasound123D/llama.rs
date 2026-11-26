@@ -272,7 +272,168 @@ mod inner {
         const FTZ_DAZ: u32 = 0x8000 | 0x0040;
         let mxcsr = unsafe { _mm_getcsr_asm() };
         unsafe { _mm_setcsr_asm(mxcsr | FTZ_DAZ) };
-        let r = if have_avx2_fma() {
+        // Phase 7: AVX-512 flash (16-lane dots, exp16, 8-key V blocks)
+        // when available; the AVX2 kernel stays the fallback.
+        let r = if have_avx512() {
+            #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+            unsafe fn flash512(
+                q: &[f32], k_all: &[f32], v_all: &[f32],
+                nkv: usize, kv_head: usize, lo: usize, n_kv: usize,
+                hd: usize, scale: f32, out: &mut [f32],
+            ) {
+                let stride = nkv * hd;
+                let koff = kv_head * hd;
+                let mut s = [0f32; FLASH_BK];
+                let mut e = [0f32; FLASH_BK];
+                let mut m_run = f32::NEG_INFINITY;
+                let mut l_run = 0f32;
+                let mut p = lo;
+                let np = hd & !15;
+                while p < n_kv {
+                    let bsz = usize::min(FLASH_BK, n_kv - p);
+                    // 1) block dots — 4 independent 16-lane accumulator
+                    //    chains (the serial-chain latency is ~4x worse)
+                    for j in 0..bsz {
+                        let krow = k_all.as_ptr().add((p + j) * stride + koff);
+                        let qp = q.as_ptr();
+                        let mut a0 = _mm512_setzero_ps();
+                        let mut a1 = _mm512_setzero_ps();
+                        let mut a2 = _mm512_setzero_ps();
+                        let mut a3 = _mm512_setzero_ps();
+                        let mut i = 0;
+                        while i + 64 <= np {
+                            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(qp.add(i)), _mm512_loadu_ps(krow.add(i)), a0);
+                            a1 = _mm512_fmadd_ps(_mm512_loadu_ps(qp.add(i + 16)), _mm512_loadu_ps(krow.add(i + 16)), a1);
+                            a2 = _mm512_fmadd_ps(_mm512_loadu_ps(qp.add(i + 32)), _mm512_loadu_ps(krow.add(i + 32)), a2);
+                            a3 = _mm512_fmadd_ps(_mm512_loadu_ps(qp.add(i + 48)), _mm512_loadu_ps(krow.add(i + 48)), a3);
+                            i += 64;
+                        }
+                        while i < np {
+                            a0 = _mm512_fmadd_ps(_mm512_loadu_ps(qp.add(i)), _mm512_loadu_ps(krow.add(i)), a0);
+                            i += 16;
+                        }
+                        let acc = _mm512_add_ps(_mm512_add_ps(a0, a1), _mm512_add_ps(a2, a3));
+                        let mut d = _mm512_reduce_add_ps(acc);
+                        while i < hd {
+                            d += q[i] * *krow.add(i);
+                            i += 1;
+                        }
+                        s[j] = d * scale;
+                    }
+                    // 2) block max → running-max update
+                    let mut m_b = f32::NEG_INFINITY;
+                    for j in 0..bsz {
+                        if s[j] > m_b { m_b = s[j]; }
+                    }
+                    let m_new = if m_run > m_b { m_run } else { m_b };
+                    // 3) rescale `out` by exp(m_run − m_new)
+                    let corr = (m_run - m_new).exp();
+                    let vc = _mm512_set1_ps(corr);
+                    let mut i = 0;
+                    while i < np {
+                        let o_ = _mm512_loadu_ps(out.as_ptr().add(i) as *const f32);
+                        _mm512_storeu_ps(out.as_mut_ptr().add(i) as *mut f32, _mm512_mul_ps(o_, vc));
+                        i += 16;
+                    }
+                    while i < hd {
+                        out[i] *= corr;
+                        i += 1;
+                    }
+                    // 4) block exps + their sum (exp16)
+                    let mut l_b = 0f32;
+                    let mn = _mm512_set1_ps(m_new);
+                    let mut j = 0;
+                    while j + 16 <= bsz {
+                        let v = _mm512_loadu_ps(s.as_ptr().add(j) as *const f32);
+                        let ex = exp16(_mm512_sub_ps(v, mn));
+                        _mm512_storeu_ps(e.as_mut_ptr().add(j), ex);
+                        l_b += _mm512_reduce_add_ps(ex);
+                        j += 16;
+                    }
+                    for jj in j..bsz {
+                        let ex = (s[jj] - m_new).exp();
+                        e[jj] = ex;
+                        l_b += ex;
+                    }
+                    l_run = l_run * corr + l_b;
+                    // 5) V accumulation — 8 keys per pass, out in registers
+                    let mut j = 0;
+                    while j + 8 <= bsz {
+                        let e0 = _mm512_set1_ps(e[j]);
+                        let e1 = _mm512_set1_ps(e[j + 1]);
+                        let e2 = _mm512_set1_ps(e[j + 2]);
+                        let e3 = _mm512_set1_ps(e[j + 3]);
+                        let e4 = _mm512_set1_ps(e[j + 4]);
+                        let e5 = _mm512_set1_ps(e[j + 5]);
+                        let e6 = _mm512_set1_ps(e[j + 6]);
+                        let e7 = _mm512_set1_ps(e[j + 7]);
+                        let v0 = v_all.as_ptr().add((p + j) * stride + koff);
+                        let v1 = v_all.as_ptr().add((p + j + 1) * stride + koff);
+                        let v2 = v_all.as_ptr().add((p + j + 2) * stride + koff);
+                        let v3 = v_all.as_ptr().add((p + j + 3) * stride + koff);
+                        let v4 = v_all.as_ptr().add((p + j + 4) * stride + koff);
+                        let v5 = v_all.as_ptr().add((p + j + 5) * stride + koff);
+                        let v6 = v_all.as_ptr().add((p + j + 6) * stride + koff);
+                        let v7 = v_all.as_ptr().add((p + j + 7) * stride + koff);
+                        let mut i = 0;
+                        while i < np {
+                            let acc = _mm512_loadu_ps(out.as_ptr().add(i) as *const f32);
+                            let a = _mm512_fmadd_ps(e0, _mm512_loadu_ps(v0.add(i)), acc);
+                            let a = _mm512_fmadd_ps(e1, _mm512_loadu_ps(v1.add(i)), a);
+                            let a = _mm512_fmadd_ps(e2, _mm512_loadu_ps(v2.add(i)), a);
+                            let a = _mm512_fmadd_ps(e3, _mm512_loadu_ps(v3.add(i)), a);
+                            let a = _mm512_fmadd_ps(e4, _mm512_loadu_ps(v4.add(i)), a);
+                            let a = _mm512_fmadd_ps(e5, _mm512_loadu_ps(v5.add(i)), a);
+                            let a = _mm512_fmadd_ps(e6, _mm512_loadu_ps(v6.add(i)), a);
+                            let a = _mm512_fmadd_ps(e7, _mm512_loadu_ps(v7.add(i)), a);
+                            _mm512_storeu_ps(out.as_mut_ptr().add(i) as *mut f32, a);
+                            i += 16;
+                        }
+                        while i < hd {
+                            out[i] += e[j] * *v0.add(i) + e[j + 1] * *v1.add(i)
+                                + e[j + 2] * *v2.add(i) + e[j + 3] * *v3.add(i)
+                                + e[j + 4] * *v4.add(i) + e[j + 5] * *v5.add(i)
+                                + e[j + 6] * *v6.add(i) + e[j + 7] * *v7.add(i);
+                            i += 1;
+                        }
+                        j += 8;
+                    }
+                    // remainder keys (1–7) of the block
+                    for jj in j..bsz {
+                        let ej = _mm512_set1_ps(e[jj]);
+                        let vj = v_all.as_ptr().add((p + jj) * stride + koff);
+                        let mut i = 0;
+                        while i < np {
+                            let acc = _mm512_loadu_ps(out.as_ptr().add(i) as *const f32);
+                            let a = _mm512_fmadd_ps(ej, _mm512_loadu_ps(vj.add(i)), acc);
+                            _mm512_storeu_ps(out.as_mut_ptr().add(i) as *mut f32, a);
+                            i += 16;
+                        }
+                        while i < hd {
+                            out[i] += e[jj] * *vj.add(i);
+                            i += 1;
+                        }
+                    }
+                    m_run = m_new;
+                    p += bsz;
+                }
+                if l_run > 0.0 {
+                    let inv = 1.0 / l_run;
+                    let vi = _mm512_set1_ps(inv);
+                    let mut i = 0;
+                    while i < np {
+                        let o_ = _mm512_loadu_ps(out.as_ptr().add(i) as *const f32);
+                        _mm512_storeu_ps(out.as_mut_ptr().add(i) as *mut f32, _mm512_mul_ps(o_, vi));
+                        i += 16;
+                    }
+                    while i < hd {
+                        out[i] *= inv;
+                        i += 1;
+                    }
+                }
+            }
+            Some(unsafe { flash512(q, k_all, v_all, nkv, kv_head, lo, n_kv, hd, scale, out) })
+        } else if have_avx2_fma() {
             #[target_feature(enable = "avx2,fma")]
             unsafe fn flash(
                 q: &[f32], k_all: &[f32], v_all: &[f32],
@@ -475,7 +636,295 @@ mod inner {
             for o in out.iter_mut() { *o *= inv as f32; }
         }
     }
+    // ---------- Phase 7: activation-side AVX-512 kernels ----------
+    // The prefill audit showed the scalar f64 activation loops (swiglu,
+    // residual adds, rmsnorm) at ~1.6 ms/token of prefill wall; these
+    // kernels run the same math in the f32 SIMD domain — the domain
+    // llama.cpp's own activation code computes in.
+
+    fn have_avx512() -> bool {
+        static A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *A.get_or_init(|| {
+            std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512vl")
+        })
+    }
+
+    /// 16-lane vectorized exp — the same `2^k` decomposition as `exp8`
+    /// above (t = x·log2e, k = round(t), r = (t−k)·ln2, degree-7 Horner
+    /// poly, 2^k via exponent bits, k clamped to ≥ −126).
+    #[target_feature(enable = "avx512f")]
+    unsafe fn exp16(x: __m512) -> __m512 {
+        const LOG2E: f32 = 1.4426950408889634;
+        const LN2: f32 = 0.6931471805599453;
+        let t = _mm512_mul_ps(x, _mm512_set1_ps(LOG2E));
+        let k = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        let r = _mm512_mul_ps(_mm512_sub_ps(t, k), _mm512_set1_ps(LN2));
+        let p = _mm512_set1_ps(1.0 / 5040.0);
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0 / 720.0));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0 / 120.0));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0 / 24.0));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0 / 6.0));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0 / 2.0));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0));
+        let p = _mm512_fmadd_ps(r, p, _mm512_set1_ps(1.0));
+        let ki = _mm512_cvtps_epi32(k);
+        let ki = _mm512_max_epi32(ki, _mm512_set1_epi32(-126));
+        let bits = _mm512_slli_epi32(_mm512_add_epi32(ki, _mm512_set1_epi32(127)), 23);
+        let two_k = _mm512_castsi512_ps(bits);
+        _mm512_mul_ps(p, two_k)
+    }
+
+    /// `out[i] = silu(g[i]) * u[i]` — the swiglu row kernel (batch and
+    /// decode share it). f32 SIMD domain; saturates to 0 / x naturally.
+    pub fn silu_mul(g: &[f32], u: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(g.len(), u.len());
+        debug_assert_eq!(g.len(), out.len());
+        if have_avx512() {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn k(g: &[f32], u: &[f32], out: &mut [f32]) {
+                let n = g.len();
+                let np = n & !15;
+                let one = _mm512_set1_ps(1.0);
+                let mut i = 0;
+                while i < np {
+                    let gv = _mm512_loadu_ps(g.as_ptr().add(i) as *const f32);
+                    let uv = _mm512_loadu_ps(u.as_ptr().add(i) as *const f32);
+                    // silu(x) = x / (1 + exp(-x)) = x * 1/(1+e)
+                    let e = exp16(_mm512_sub_ps(_mm512_setzero_ps(), gv));
+                    let d = _mm512_add_ps(one, e);
+                    let silu = _mm512_div_ps(gv, d);
+                    let r = _mm512_mul_ps(silu, uv);
+                    _mm512_storeu_ps(out.as_mut_ptr().add(i) as *mut f32, r);
+                    i += 16;
+                }
+                while i < n {
+                    out[i] = g[i] / (1.0 + (-g[i]).exp());
+                    i += 1;
+                }
+            }
+            return unsafe { k(g, u, out) };
+        }
+        for i in 0..g.len() {
+            out[i] = g[i] / (1.0 + (-g[i] as f64).exp() as f32) * u[i];
+        }
+    }
+
+    /// `x[i] += y[i]` (residual adds).
+    pub fn vec_add(x: &mut [f32], y: &[f32]) {
+        debug_assert_eq!(x.len(), y.len());
+        if have_avx512() {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn k(x: &mut [f32], y: &[f32]) {
+                let n = x.len();
+                let np = n & !15;
+                let mut i = 0;
+                while i < np {
+                    let xv = _mm512_loadu_ps(x.as_ptr().add(i) as *const f32);
+                    let yv = _mm512_loadu_ps(y.as_ptr().add(i) as *const f32);
+                    _mm512_storeu_ps(x.as_mut_ptr().add(i) as *mut f32, _mm512_add_ps(xv, yv));
+                    i += 16;
+                }
+                while i < n {
+                    x[i] += y[i];
+                    i += 1;
+                }
+            }
+            return unsafe { k(x, y) };
+        }
+        for i in 0..x.len() {
+            x[i] += y[i];
+        }
+    }
+
+    /// rmsnorm into `out` — f32 SIMD accumulation (the ggml numerics
+    /// class: 16-lane sum, mean, scale, then x·scale·w).
+    pub fn rmsnorm_into(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+        debug_assert_eq!(x.len(), w.len());
+        debug_assert_eq!(x.len(), out.len());
+        if have_avx512() {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn k(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+                let n = x.len();
+                let np = n & !15;
+                let mut acc = _mm512_setzero_ps();
+                let mut i = 0;
+                while i < np {
+                    let xv = _mm512_loadu_ps(x.as_ptr().add(i) as *const f32);
+                    acc = _mm512_fmadd_ps(xv, xv, acc);
+                    i += 16;
+                }
+                let mut ss = _mm512_reduce_add_ps(acc);
+                while i < n {
+                    ss += x[i] * x[i];
+                    i += 1;
+                }
+                let mean = ss / n as f32;
+                let scale = 1.0 / (mean + eps).sqrt();
+                let vs = _mm512_set1_ps(scale);
+                let mut i = 0;
+                while i < np {
+                    let xv = _mm512_loadu_ps(x.as_ptr().add(i) as *const f32);
+                    let wv = _mm512_loadu_ps(w.as_ptr().add(i) as *const f32);
+                    let r = _mm512_mul_ps(_mm512_mul_ps(xv, vs), wv);
+                    _mm512_storeu_ps(out.as_mut_ptr().add(i) as *mut f32, r);
+                    i += 16;
+                }
+                while i < n {
+                    out[i] = x[i] * scale * w[i];
+                    i += 1;
+                }
+            }
+            return unsafe { k(x, w, eps, out) };
+        }
+        // scalar fallback: the historical f64-stable reference
+        let n = x.len();
+        let mut ss = 0f64;
+        for v in x { ss += (*v as f64) * (*v as f64); }
+        let mean = ss / n as f64;
+        let scale = 1.0 / (mean + eps as f64).sqrt();
+        for i in 0..n {
+            out[i] = (x[i] as f64 * scale * (w[i] as f64)) as f32;
+        }
+    }
+
+    /// rmsnorm in place.
+    pub fn rmsnorm_inplace(x: &mut [f32], w: &[f32], eps: f32) {
+        if have_avx512() {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn k(x: &mut [f32], w: &[f32], eps: f32) {
+                let n = x.len();
+                let np = n & !15;
+                let mut acc = _mm512_setzero_ps();
+                let mut i = 0;
+                while i < np {
+                    let xv = _mm512_loadu_ps(x.as_ptr().add(i) as *const f32);
+                    acc = _mm512_fmadd_ps(xv, xv, acc);
+                    i += 16;
+                }
+                let mut ss = _mm512_reduce_add_ps(acc);
+                while i < n {
+                    ss += x[i] * x[i];
+                    i += 1;
+                }
+                let mean = ss / n as f32;
+                let scale = 1.0 / (mean + eps).sqrt();
+                let vs = _mm512_set1_ps(scale);
+                let mut i = 0;
+                while i < np {
+                    let xv = _mm512_loadu_ps(x.as_ptr().add(i) as *const f32);
+                    let wv = _mm512_loadu_ps(w.as_ptr().add(i) as *const f32);
+                    let r = _mm512_mul_ps(_mm512_mul_ps(xv, vs), wv);
+                    _mm512_storeu_ps(x.as_mut_ptr().add(i) as *mut f32, r);
+                    i += 16;
+                }
+                while i < n {
+                    x[i] = x[i] * scale * w[i];
+                    i += 1;
+                }
+            }
+            return unsafe { k(x, w, eps) };
+        }
+        let n = x.len();
+        let mut ss = 0f64;
+        for v in x.iter() { ss += (*v as f64) * (*v as f64); }
+        let mean = ss / n as f64;
+        let scale = 1.0 / (mean + eps as f64).sqrt();
+        for i in 0..n {
+            x[i] = (x[i] as f64 * scale * (w[i] as f64)) as f32;
+        }
+    }
+
+    /// 8-wide tap dot for the shortconv core: `sum_j k8[j] * w8[j]`
+    /// (8 taps; the caller pads the 7-tap kernel with a zero).
+    /// 256-bit domain — the buffers are exactly 8 floats.
+    pub fn conv_tap8(w8: &[f32], k8: &[f32]) -> f32 {
+        debug_assert!(w8.len() >= 8 && k8.len() >= 8);
+        if have_avx512() {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn k(w8: &[f32], k8: &[f32]) -> f32 {
+                let wv = _mm256_loadu_ps(w8.as_ptr() as *const f32);
+                let kv = _mm256_loadu_ps(k8.as_ptr() as *const f32);
+                let d = _mm256_mul_ps(wv, kv);
+                let hi = _mm256_extractf128_ps(d, 1);
+                let lo = _mm256_castps256_ps128(d);
+                let s128 = _mm_add_ps(lo, hi);
+                let s2 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+                let s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+                _mm_cvtss_f32(s1)
+            }
+            return unsafe { k(w8, k8) };
+        }
+        let mut s = 0f64;
+        for j in 0..8 { s += (k8[j] as f64) * (w8[j] as f64); }
+        s as f32
+    }
+
+
+    /// Phase 7 conv window fill: `w[ch*stride + d_conv + r] = b[r][ch]·x[r][ch]`
+    /// — an 8x8-tiled transpose-multiply. The previous per-(ch,r) loop did
+    /// two 24KB-strided loads and one strided store per ELEMENT (the
+    /// profiled 606 µs/token); this form streams the b/x rows contiguously
+    /// and writes 8 consecutive r's per channel store.
+    pub fn conv_fill_bx(inproj: &[f32], n_e: usize, m: usize, d_conv: usize, w: &mut [f32], stride: usize) {
+        if have_avx512() {
+            #[target_feature(enable = "avx512f")]
+            unsafe fn k(inproj: &[f32], n_e: usize, m: usize, d_conv: usize, w: &mut [f32], stride: usize) {
+                let row = 3 * n_e;
+                let ch8 = n_e & !7;
+                let m8 = m & !7;
+                let mut tile = [[0f32; 8]; 8];
+                for ch0 in (0..ch8).step_by(8) {
+                    for r0 in (0..m8).step_by(8) {
+                        // 8 rows x 8 channels: contiguous loads of b and x
+                        for i in 0..8 {
+                            // 8 channels = 256 bits per row load
+                            let b = _mm256_loadu_ps(inproj.as_ptr().add((r0 + i) * row + ch0) as *const f32);
+                            let x = _mm256_loadu_ps(inproj.as_ptr().add((r0 + i) * row + 2 * n_e + ch0) as *const f32);
+                            let p = _mm256_mul_ps(b, x);
+                            _mm256_storeu_ps(tile[i].as_mut_ptr() as *mut f32, p);
+                        }
+                        // 8 column stores (8 consecutive r's per channel)
+                        for j in 0..8 {
+                            let col = _mm256_setr_ps(
+                                tile[0][j], tile[1][j], tile[2][j], tile[3][j],
+                                tile[4][j], tile[5][j], tile[6][j], tile[7][j],
+                            );
+                            let dst = w.as_mut_ptr().add((ch0 + j) * stride + d_conv + r0);
+                            // 8 floats = 32B store
+                            _mm256_storeu_ps(dst as *mut f32, col);
+                        }
+                    }
+                }
+                // tails (rare: m and n_e are multiples of 8 in the LFM3 shapes)
+                for ch in ch8..n_e {
+                    let wbase = w.as_mut_ptr().add(ch * stride + d_conv);
+                    for r in 0..m {
+                        let b = *inproj.get_unchecked(r * row + ch);
+                        let x = *inproj.get_unchecked(r * row + 2 * n_e + ch);
+                        *wbase.add(r) = b * x;
+                    }
+                }
+                for ch in 0..ch8 {
+                    let wbase = w.as_mut_ptr().add(ch * stride + d_conv);
+                    for r in m8..m {
+                        let b = *inproj.get_unchecked(r * row + ch);
+                        let x = *inproj.get_unchecked(r * row + 2 * n_e + ch);
+                        *wbase.add(r) = b * x;
+                    }
+                }
+            }
+            return unsafe { k(inproj, n_e, m, d_conv, w, stride) };
+        }
+        let row = 3 * n_e;
+        for ch in 0..n_e {
+            let wbase = &mut w[ch * stride + d_conv..ch * stride + d_conv + m];
+            for r in 0..m {
+                wbase[r] = inproj[r * row + ch] * inproj[r * row + 2 * n_e + ch];
+            }
+        }
+    }
 }
+
 
 #[cfg(test)]
 mod attn_flash_tests {
@@ -707,3 +1156,7 @@ mod scalar_only {
         }
     }
 }
+
+
+
+

@@ -91,16 +91,14 @@ pub fn weights1d(gguf: &GgufFile, name: &str) -> Vec<f32> {
 /// f64 accumulation (wider than llama.cpp's f32; stays within parity gates).
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let t0 = prof::tsc();
-    let n = x.len();
-    let mut ss = 0f64;
-    for v in x { ss += (*v as f64) * (*v as f64); }
-    let mean = ss / n as f64;
-    let scale = 1.0 / (mean + eps as f64).sqrt();
-    let out: Vec<f32> = x.iter().zip(w).map(|(v, wv)| (*v as f64 * scale * (*wv as f64)) as f32).collect();
+    let mut out = vec![0f32; x.len()];
+    // Phase 7: AVX-512 row kernel (f32 SIMD accumulation — the ggml numerics
+    // class; scalar f64 fallback lives inside the kernel crate).
+    llama_kernels::batch::rmsnorm_into(x, w, eps, &mut out);
     if prof::prof_enabled() {
         let b = prof::bucket("rmsnorm");
         prof::record(b, t0, 0);
-        prof::note_alloc(b, n * 4);
+        prof::note_alloc(b, x.len() * 4);
     }
     out
 }
@@ -108,30 +106,13 @@ pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 /// RMSNorm into a caller buffer (Phase 6.5 batched rows; no allocation).
 /// `out` may alias `x` (the mean is fully accumulated before any write).
 pub fn rmsnorm_into(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
-    let n = x.len();
-    debug_assert_eq!(out.len(), n);
-    let mut ss = 0f64;
-    for v in x { ss += (*v as f64) * (*v as f64); }
-    let mean = ss / n as f64;
-    let scale = 1.0 / (mean + eps as f64).sqrt();
-    for i in 0..n {
-        out[i] = (x[i] as f64 * scale * (w[i] as f64)) as f32;
-    }
+    llama_kernels::batch::rmsnorm_into(x, w, eps, out);
 }
 
 /// RMSNorm in place (Phase 6.5 rows): same formula, no aliasing gymnastics.
 /// (mean fully accumulated before the first write)
 pub fn rmsnorm_inplace(x: &mut [f32], w: &[f32], eps: f32) {
-    let n = x.len();
-    let mut ss = 0f64;
-    for v in x.iter() {
-        ss += (*v as f64) * (*v as f64);
-    }
-    let mean = ss / n as f64;
-    let scale = 1.0 / (mean + eps as f64).sqrt();
-    for i in 0..n {
-        x[i] = (x[i] as f64 * scale * (w[i] as f64)) as f32;
-    }
+    llama_kernels::batch::rmsnorm_inplace(x, w, eps);
 }
 
 #[inline]
@@ -180,21 +161,82 @@ pub fn rope_neox_inplace(heads: &mut [f32], pos: usize, base: f64, factors: Opti
     let t0 = prof::tsc();
     let d = heads.len(); // head_dim (this operates on a single head)
     let half = d / 2;
-    // theta_scale = base^(-2/d); theta_j = pos·base^(-2j/d)
-    let theta_scale = base.powf(-2.0 / d as f64);
-    let mut theta = pos as f64;
+    // Phase 7: sin/cos table cache — the angles replicate the scalar
+    // loop's exact successive-multiply theta chain (bit-identical), one
+    // table per (base, head_dim, factors-content) grown lazily by
+    // position; the per-call work is table gathers + the 2x2 rotations.
+    let tab = rope_table(base, d, factors, pos + 1);
+    let (sins, coss) = (&tab.sins, &tab.coss);
+    let off = pos * half;
     for j in 0..half {
-        let ff = factors.map(|f| f[j] as f64).unwrap_or(1.0);
-        let angle = theta / ff;
-        let (s, c) = (angle.sin(), angle.cos());
+        let (s, c) = (sins[off + j], coss[off + j]);
         let x0 = heads[j] as f64;
         let x1 = heads[j + half] as f64;
         heads[j] = (x0 * c - x1 * s) as f32;
         heads[j + half] = (x0 * s + x1 * c) as f32;
-        theta *= theta_scale;
     }
     if prof::prof_enabled() {
         prof::record(prof::bucket("rope"), t0, 0);
+    }
+}
+
+struct RopeTable {
+    sins: Vec<f64>,
+    coss: Vec<f64>,
+    half: usize,
+}
+
+/// Build/extend the (base, d, factors) table so it covers positions
+/// 0..n. Angles: theta = pos, then theta·base^(-2/d) per step, divided by
+/// the learned factor when present — the exact scalar-loop sequence.
+fn rope_table(base: f64, d: usize, factors: Option<&[f32]>, n: usize) -> &'static RopeTable {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static TABLES: std::sync::OnceLock<Mutex<HashMap<(u64, u16, u64), Box<RopeTable>>>> = std::sync::OnceLock::new();
+    // key: base bits, head dim, factors fingerprint (0 = none)
+    let fkey = match factors {
+        None => 0u64,
+        Some(f) => {
+            let mut h = 1469598103934665603u64;
+            for v in f {
+                h ^= v.to_bits() as u64;
+                h = h.wrapping_mul(1099511628211);
+            }
+            h
+        }
+    };
+    let maps = TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (base.to_bits(), d as u16, fkey);
+    let mut m = maps.lock().unwrap();
+    let entry: &mut RopeTable = m.entry(key).or_insert_with(|| {
+        let half = d / 2;
+        let mut t = Box::new(RopeTable { sins: Vec::new(), coss: Vec::new(), half });
+        grow_rope_table(&mut t, base, d, factors, n);
+        t
+    });
+    let need = n * entry.half;
+    if entry.sins.len() < need {
+        grow_rope_table(entry, base, d, factors, n);
+    }
+    // SAFETY: the HashMap lives in a process-wide OnceLock and is never
+    // cleared; entries are boxed and never removed, so the reference stays
+    // valid for the program lifetime.
+    unsafe { &*(entry as *const RopeTable) }
+}
+
+fn grow_rope_table(t: &mut RopeTable, base: f64, d: usize, factors: Option<&[f32]>, n: usize) {
+    let half = t.half;
+    let theta_scale = base.powf(-2.0 / d as f64);
+    let start = t.sins.len() / half;
+    for pos in start..n {
+        let mut theta = pos as f64;
+        for j in 0..half {
+            let ff = factors.map(|f| f[j] as f64).unwrap_or(1.0);
+            let angle = theta / ff;
+            t.sins.push(angle.sin());
+            t.coss.push(angle.cos());
+            theta *= theta_scale;
+        }
     }
 }
 
